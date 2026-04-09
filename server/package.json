@@ -5,7 +5,11 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js",
-    "test": "jest --runInBand"
+    "test": "jest --runInBand",
+    "questions:seed-verify": "node scripts/seedMissingQuestionCoverage.js && node scripts/verifyData.js",
+    "questions:verify-only": "node scripts/verifyData.js",
+    "questions:reset-seed": "node scripts/cleanInvalidQuestions.js && node scripts/seedMissingQuestionCoverage.js && node scripts/verifyData.js",
+    "roles:backfill-domains": "node scripts/backfillRoleDomains.js"
   },
   "keywords": [],
   "author": "",

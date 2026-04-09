@@ -3,6 +3,7 @@ import axios from 'axios';
 import { useAuth } from '../../context/AuthContext';
 import FacultyLayout from '../../components/FacultyLayout';
 import authService from '../../services/authService';
+import useAutoRefresh from '../../hooks/useAutoRefresh';
 
 export default function FacultyStudents() {
   const { user } = useAuth();
@@ -17,7 +18,8 @@ export default function FacultyStudents() {
     fetchStudents();
   }, []);
 
-  const fetchStudents = async () => {
+  const fetchStudents = async ({ silent = false } = {}) => {
+    if (!silent) setLoading(true);
     try {
       const token = authService.getToken();
       const profilesRes = await axios.get('http://localhost:5000/api/profile/all', {
@@ -27,9 +29,11 @@ export default function FacultyStudents() {
     } catch (err) {
       console.error('Failed to fetch students:', err);
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   };
+
+  useAutoRefresh(fetchStudents, { intervalMs: 30000 });
 
   const viewStudentDetails = async (studentProfile) => {
     try {
@@ -66,39 +70,6 @@ export default function FacultyStudents() {
       setSelectedStudent(studentProfile);
       setAssessmentHistory([]);
       setShowModal(true);
-    }
-  };
-
-  const handleQualifySkill = async (assessment) => {
-    try {
-      const token = authService.getToken();
-      await axios.put(
-        `http://localhost:5000/api/faculty/assessments/${assessment._id}/qualify-skill`,
-        {},
-        { headers: { Authorization: `Bearer ${token}` } }
-      );
-
-      // Refresh modal data after qualification
-      if (selectedStudent?.userId) {
-        const [profilesRes, historyRes] = await Promise.all([
-          axios.get('http://localhost:5000/api/profile/all', {
-            headers: { Authorization: `Bearer ${token}` }
-          }),
-          axios.get(`http://localhost:5000/api/faculty/assessments/student/${selectedStudent.userId}`, {
-            headers: { Authorization: `Bearer ${token}` }
-          })
-        ]);
-
-        const updatedStudent = (profilesRes.data || []).find((p) => p.userId === selectedStudent.userId);
-        if (updatedStudent) {
-          setSelectedStudent((prev) => ({ ...prev, ...updatedStudent }));
-        }
-        setAssessmentHistory(historyRes.data.assessments || []);
-      }
-
-      alert('Skill qualified successfully and updated in profile');
-    } catch (err) {
-      alert(err.response?.data?.message || 'Failed to qualify skill');
     }
   };
 
@@ -189,22 +160,137 @@ export default function FacultyStudents() {
                   <div className="col-6"><small className="text-muted">CGPA</small><div>{selectedStudent.cgpa || 'N/A'}</div></div>
                 </div>
 
-                {selectedStudent.qualifiedSkills?.length > 0 && (
+                {selectedStudent.selectedRole?.finalAssessmentPassed && (
                   <div className="mb-4">
-                    <h6 className="mb-2">Qualified Skills</h6>
+                    <h6 className="mb-2">Current Qualified Role</h6>
+                    <div className="mb-2">
+                      <span className="badge text-bg-success">
+                        {selectedStudent.selectedRole?.trackName || selectedStudent.selectedRole?.roleId?.roleName || 'Qualified Role'}
+                      </span>
+                    </div>
+                    <small className="text-muted d-block mb-2">
+                      Final assessment passed. Student is marked proficient in required role skills.
+                    </small>
                     <div className="d-flex flex-wrap gap-2">
-                      {selectedStudent.qualifiedSkills.map((q) => (
+                      {(selectedStudent.qualifiedSkills || []).map((q) => (
                         <span key={`${q.skillName}-${q.level}`} className="badge text-bg-success">
-                          {q.skillName} ({q.level})
+                          {q.skillName}
                         </span>
                       ))}
                     </div>
                   </div>
                 )}
 
+                {Array.isArray(selectedStudent.qualifiedRoles) && selectedStudent.qualifiedRoles.length > 0 && (
+                  <div className="mb-4">
+                    <h6 className="mb-2">All Qualified Roles</h6>
+                    <div className="d-flex flex-wrap gap-2 mb-2">
+                      {selectedStudent.qualifiedRoles.map((entry, index) => (
+                        <span
+                          key={`${entry?.roleId?._id || entry?.roleId || entry?.roleName || 'qualified'}-${index}`}
+                          className="badge text-bg-success"
+                        >
+                          {entry?.trackName || entry?.roleName || entry?.roleId?.roleName || 'Qualified Role'}
+                        </span>
+                      ))}
+                    </div>
+                    <ul className="list-group list-group-flush">
+                      {selectedStudent.qualifiedRoles.map((entry, index) => (
+                        <li
+                          key={`qualified-role-date-${entry?.roleId?._id || entry?.roleId || entry?.qualifiedAt || index}`}
+                          className="list-group-item px-0"
+                        >
+                          <div className="d-flex justify-content-between align-items-center gap-2 flex-wrap">
+                            <span className="fw-semibold">
+                              {entry?.trackName || entry?.roleName || entry?.roleId?.roleName || 'Qualified Role'}
+                            </span>
+                            <small className="text-muted">
+                              {entry?.qualifiedAt
+                                ? `Qualified on ${new Date(entry.qualifiedAt).toLocaleString()}`
+                                : 'Qualification date unavailable'}
+                            </small>
+                          </div>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+
+                {selectedStudent.selectedRole?.roleId && !selectedStudent.selectedRole?.finalAssessmentPassed && (
+                  <div className="mb-4">
+                    <h6 className="mb-2">Qualification Status</h6>
+                    <span className="badge text-bg-warning">Not Qualified Yet</span>
+                    <small className="text-muted d-block mt-2">
+                      Role selected, but final assessment is not passed yet.
+                    </small>
+                  </div>
+                )}
+
                 {assessmentHistory.length > 0 && (
                   <div className="mt-4">
+                      {/* Skill Summary at Top */}
+                      <div className="mb-4 p-3 bg-light rounded">
+                        <h6 className="mb-3">Skill Performance Summary</h6>
+                        <div className="table-responsive">
+                          <table className="table table-sm mb-0">
+                            <thead>
+                              <tr>
+                                <th>Skill</th>
+                                <th>Beginner</th>
+                                <th>Intermediate</th>
+                                <th>Advanced</th>
+                                <th>Status</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {(() => {
+                                const skillMap = {};
+                                assessmentHistory.forEach(a => {
+                                  const skill = a.skillName || a.skillId?.name || 'Unknown';
+                                  if (!skillMap[skill]) {
+                                    skillMap[skill] = {
+                                      beginner: { scores: [], attempts: 0 },
+                                      intermediate: { scores: [], attempts: 0 },
+                                      advanced: { scores: [], attempts: 0 },
+                                    };
+                                  }
+                                  if (a.status === 'completed') {
+                                    const level = a.level || 'beginner';
+                                    if (skillMap[skill][level]) {
+                                      skillMap[skill][level].scores.push(a.score || 0);
+                                      skillMap[skill][level].attempts++;
+                                    }
+                                  }
+                                });
+                              
+                                return Object.entries(skillMap).map(([skill, data]) => {
+                                  const beginnerBest = data.beginner.scores.length > 0 ? Math.max(...data.beginner.scores) : 0;
+                                  const intermediateBest = data.intermediate.scores.length > 0 ? Math.max(...data.intermediate.scores) : 0;
+                                  const advancedBest = data.advanced.scores.length > 0 ? Math.max(...data.advanced.scores) : 0;
+                                  const totalAttempts = data.beginner.attempts + data.intermediate.attempts + data.advanced.attempts;
+                                  const maxScore = Math.max(beginnerBest, intermediateBest, advancedBest);
+
+                                  const statusBg = maxScore >= 90 ? 'success' : maxScore >= 50 ? 'warning' : 'danger';
+                                  const statusText = totalAttempts === 0 ? 'Not Started' : maxScore >= 90 ? 'Excellent' : maxScore >= 50 ? 'In Progress' : 'Needs Work';
+                                
+                                  return (
+                                    <tr key={skill}>
+                                      <td><strong>{skill}</strong></td>
+                                      <td>{beginnerBest}% ({data.beginner.attempts})</td>
+                                      <td>{intermediateBest}% ({data.intermediate.attempts})</td>
+                                      <td>{advancedBest}% ({data.advanced.attempts})</td>
+                                      <td><span className={`badge text-bg-${statusBg}`}>{statusText}</span></td>
+                                    </tr>
+                                  );
+                                });
+                              })()}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+
                     <h6 className="mb-3">Assessment History ({assessmentHistory.length} total)</h6>
+
                     <div className="table-responsive">
                       <table className="table table-sm table-hover">
                         <thead>
@@ -215,7 +301,6 @@ export default function FacultyStudents() {
                             <th>Score</th>
                             <th>Status</th>
                             <th>Date</th>
-                            <th>Action</th>
                           </tr>
                         </thead>
                         <tbody>
@@ -235,70 +320,12 @@ export default function FacultyStudents() {
                               </td>
                               <td><span className="badge text-bg-secondary">{assess.status}</span></td>
                               <td className="small text-muted">{new Date(assess.createdAt).toLocaleString()}</td>
-                              <td>
-                                {assess.status === 'completed' && !/^final assessment$/i.test(String(assess.skillName || assess.skillId?.name || '')) ? (
-                                  <button
-                                    className="btn btn-sm btn-outline-success"
-                                    onClick={() => handleQualifySkill(assess)}
-                                  >
-                                    Qualify
-                                  </button>
-                                ) : (
-                                  <span className="text-muted small">-</span>
-                                )}
-                              </td>
                             </tr>
                           ))}
                         </tbody>
                       </table>
                     </div>
 
-                    {/* Summary by Skill and Level */}
-                    <div className="mt-3">
-                      <h6 className="mb-2">Summary by Skill</h6>
-                      {(() => {
-                        const skillMap = {};
-                        assessmentHistory.forEach(a => {
-                          if (a.status !== 'completed') return;
-                          const skill = a.skillName || a.skillId?.name || 'Unknown';
-                          const level = a.level || 'beginner';
-                          if (!skillMap[skill]) {
-                            skillMap[skill] = { beginner: [], intermediate: [], advanced: [] };
-                          }
-                          if (skillMap[skill][level]) {
-                            skillMap[skill][level].push(a.score || 0);
-                          }
-                        });
-
-                        return (
-                          <div className="row g-2">
-                            {Object.entries(skillMap).map(([skill, levels]) => (
-                              <div key={skill} className="col-12">
-                                <div className="p-3 border rounded">
-                                  <strong>{skill}</strong>
-                                  <div className="d-flex gap-3 mt-2 small">
-                                    {['beginner', 'intermediate', 'advanced'].map(lvl => {
-                                      const scores = levels[lvl];
-                                      if (!scores || scores.length === 0) return null;
-                                      const best = Math.max(...scores);
-                                      const attempts = scores.length;
-                                      return (
-                                        <div key={lvl}>
-                                          <span className="text-muted text-capitalize">{lvl}:</span>{' '}
-                                          <strong className={best >= 90 ? 'text-success' : best >= 50 ? 'text-warning' : 'text-danger'}>
-                                            {best}%
-                                          </strong> ({attempts} attempt{attempts !== 1 ? 's' : ''})
-                                        </div>
-                                      );
-                                    })}
-                                  </div>
-                                </div>
-                              </div>
-                            ))}
-                          </div>
-                        );
-                      })()}
-                    </div>
                   </div>
                 )}
 

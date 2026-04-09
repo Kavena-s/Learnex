@@ -9,8 +9,10 @@ export default function ProfileSetup() {
   const { user } = useAuth();
   const navigate = useNavigate();
   const [loading, setLoading] = useState(false);
+  const [recommendLoading, setRecommendLoading] = useState(false);
   const [error, setError] = useState('');
   const [successMessage, setSuccessMessage] = useState('');
+  const [qualificationInfo, setQualificationInfo] = useState(null);
 
   const email = user?.email || user?.firebaseUser?.email || '';
   const [registeredName, setRegisteredName] = useState(user?.name || '');
@@ -126,6 +128,19 @@ export default function ProfileSetup() {
         const existingProjectDomain = Array.isArray(existing.projectsDone) && existing.projectsDone.length > 0
           ? (existing.projectsDone[0]?.domain || '')
           : '';
+
+        setQualificationInfo({
+          roleName: existing?.selectedRole?.trackName || existing?.selectedRole?.roleId?.roleName || '',
+          finalAssessmentPassed: Boolean(existing?.selectedRole?.finalAssessmentPassed),
+          qualifiedAt: existing?.selectedRole?.qualifiedAt || null,
+          qualifiedRoles: Array.isArray(existing?.qualifiedRoles)
+            ? existing.qualifiedRoles.map((entry) => ({
+                roleName: entry?.trackName || entry?.roleName || 'Qualified Role',
+                qualifiedAt: entry?.qualifiedAt || null,
+              }))
+            : [],
+        });
+
         setRegisteredName(existing.name || user?.name || '');
         setProfile((prev) => ({
           ...prev,
@@ -183,24 +198,30 @@ export default function ProfileSetup() {
       await axios.post('http://localhost:5000/api/profile', payload, {
         headers: { Authorization: `Bearer ${token}` }
       });
-
-      try {
-        await axios.post('http://localhost:5000/api/recommend', {}, {
-          headers: { Authorization: `Bearer ${token}` }
-        });
-        navigate('/home');
-      } catch (recommendErr) {
-        setSuccessMessage('Profile saved successfully.');
-        setError(
-          recommendErr.response?.data?.message ||
-          'Profile saved, but recommendation generation failed. Please try again.'
-        );
-      }
+      setSuccessMessage('Profile saved successfully. You can now generate recommendations.');
     } catch (err) {
       setError(err.response?.data?.message || 'Failed to save profile');
       console.error('Profile save error:', err.response?.data || err.message);
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleGenerateRecommendations = async () => {
+    setRecommendLoading(true);
+    setError('');
+    setSuccessMessage('');
+
+    try {
+      const token = authService.getToken();
+      await axios.post('http://localhost:5000/api/recommend', {}, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      navigate('/home');
+    } catch (err) {
+      setError(err.response?.data?.message || 'Failed to generate recommendations');
+    } finally {
+      setRecommendLoading(false);
     }
   };
 
@@ -233,6 +254,33 @@ export default function ProfileSetup() {
           {successMessage && (
             <div className="alert alert-success border-0 rounded-4" role="alert">
               {successMessage}
+            </div>
+          )}
+
+          {qualificationInfo?.roleName && (
+            <div className={`alert border-0 rounded-4 ${qualificationInfo.finalAssessmentPassed ? 'alert-success' : 'alert-warning'}`} role="alert">
+              <div className="d-flex flex-column flex-md-row justify-content-between align-items-md-center gap-2">
+                <div>
+                  <strong>Selected Role:</strong> {qualificationInfo.roleName}
+                  <div className="small mt-1">
+                    {qualificationInfo.finalAssessmentPassed
+                      ? 'Qualified Role: Final assessment passed.'
+                      : 'Not Qualified Yet: Complete and pass final assessment to be marked qualified.'}
+                  </div>
+                </div>
+                <span className={`badge ${qualificationInfo.finalAssessmentPassed ? 'text-bg-success' : 'text-bg-warning'}`}>
+                  {qualificationInfo.finalAssessmentPassed ? 'Qualified Role' : 'Not Qualified Yet'}
+                </span>
+              </div>
+              {qualificationInfo.finalAssessmentPassed && qualificationInfo.qualifiedAt && (
+                <small className="d-block mt-2">Qualified on: {new Date(qualificationInfo.qualifiedAt).toLocaleString()}</small>
+              )}
+              {qualificationInfo.finalAssessmentPassed && qualificationInfo.qualifiedRoles?.length > 0 && (
+                <div className="mt-2 small">
+                  <strong>Qualified Roles:</strong>{' '}
+                  {qualificationInfo.qualifiedRoles.map((entry) => entry.roleName).join(', ')}
+                </div>
+              )}
             </div>
           )}
 
@@ -409,9 +457,19 @@ export default function ProfileSetup() {
               </div>
 
               <div className="col-12 mt-3">
-                <button type="submit" disabled={loading} className="btn btn-gradient w-100 py-2">
-                  {loading ? 'Saving and Analyzing...' : 'Save Profile and Get Recommendations'}
-                </button>
+                <div className="d-flex flex-column flex-md-row gap-2">
+                  <button type="submit" disabled={loading || recommendLoading} className="btn btn-outline-light flex-fill py-2">
+                    {loading ? 'Saving Profile...' : 'Save Profile'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleGenerateRecommendations}
+                    disabled={loading || recommendLoading}
+                    className="btn btn-gradient flex-fill py-2"
+                  >
+                    {recommendLoading ? 'Generating Recommendations...' : 'Get Recommendations'}
+                  </button>
+                </div>
               </div>
             </div>
           </form>

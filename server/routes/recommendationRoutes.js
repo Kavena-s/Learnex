@@ -4,6 +4,7 @@ const {
   generateRecommendations,
   getRecommendations,
   selectRole,
+  rejectRecommendation,
   getReadinessAnalysis,
   getReadinessByUserId,
 } = require("../controllers/recommendationController");
@@ -23,5 +24,8 @@ router.get("/readiness/:userId", auth, getReadinessByUserId);
 
 // Student selects a recommended role
 router.put("/:recommendationId/select", auth, selectRole);
+
+// Student rejects a recommendation
+router.put("/:recommendationId/reject", auth, rejectRecommendation);
 
 module.exports = router;

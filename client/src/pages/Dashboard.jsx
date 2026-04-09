@@ -11,13 +11,10 @@ export default function Dashboard() {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
-  const [learningMaterials, setLearningMaterials] = useState(null);
-  const [showLearningResources, setShowLearningResources] = useState(false);
   const [assessmentSummary, setAssessmentSummary] = useState(null);
 
   useEffect(() => {
     fetchDashboard();
-    fetchLearningMaterials();
     fetchAssessmentSummary();
   }, []);
 
@@ -40,18 +37,6 @@ export default function Dashboard() {
     }
   };
 
-  const fetchLearningMaterials = async () => {
-    try {
-      const token = authService.getToken();
-      const res = await axios.get('http://localhost:5000/api/profile/learning-materials', {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      setLearningMaterials(res.data);
-    } catch (err) {
-      console.log('Learning materials not available:', err.response?.data?.message);
-    }
-  };
-
   const fetchAssessmentSummary = async () => {
     try {
       const token = authService.getToken();
@@ -68,6 +53,11 @@ export default function Dashboard() {
 
   const canAttemptLevel = (skillName, level) => {
     const skillSummary = assessmentSummary?.summary?.[skillName];
+    const levelBestScore = skillSummary?.[level]?.bestScore || 0;
+
+    // Lock this level once student has already reached 90+.
+    if (levelBestScore >= 90) return false;
+
     if (!skillSummary) return level === 'beginner';
     if (level === 'beginner') return true;
     if (level === 'intermediate') return (skillSummary.beginner?.attempts || 0) > 0;
@@ -77,6 +67,12 @@ export default function Dashboard() {
   const startAssessment = async (skillName, level) => {
     try {
       const token = authService.getToken();
+      if (!token) {
+        alert('Session expired. Please login again.');
+        authService.logout();
+        navigate('/login', { replace: true });
+        return;
+      }
       const res = await axios.post(
         'http://localhost:5000/api/assessments/start',
         { skillName, level: level || 'beginner' },
@@ -84,7 +80,19 @@ export default function Dashboard() {
       );
       navigate(`/assessment/${res.data.assessmentId}?skill=${skillName}`);
     } catch (err) {
-      alert(err.response?.data?.message || 'Failed to start assessment');
+      console.error('Start assessment error:', err.response?.data || err.message);
+      if (err.response?.status === 401) {
+        alert('Session expired. Please login again.');
+        authService.logout();
+        navigate('/login', { replace: true });
+        return;
+      }
+
+      const serverMessage = err.response?.data?.message;
+      const serverDetails = err.response?.data?.error;
+      const fallback = err.message || 'Failed to start assessment';
+      alert(serverMessage || serverDetails || fallback);
+
       if (err.response?.data?.activeAssessmentId) {
         navigate(`/assessment/${err.response.data.activeAssessmentId}?skill=${skillName}`);
       }
@@ -159,11 +167,11 @@ export default function Dashboard() {
                 </button>
               </div>
               <p className="text-muted mb-0">
-                Complete beginner, intermediate, and advanced levels for all required skills with 90+ score to unlock final assessment.
+                Complete beginner, intermediate, and advanced levels with 90+ scores to unlock final assessment.
               </p>
               {!assessmentSummary?.finalAssessmentEligible && (
                 <small className="text-danger d-block mt-2">
-                  Final assessment locked. Complete all required levels with at least 90 score.
+                  Final assessment locked. Achieve 90+ score on all required levels first.
                 </small>
               )}
             </div>
@@ -196,6 +204,7 @@ export default function Dashboard() {
                           const bestScore = levelData?.bestScore || 0;
                           const attempts = levelData?.attempts || 0;
                           const enabled = canAttemptLevel(skill, level);
+                          const lockedByHighScore = bestScore >= 90;
 
                           return (
                             <button
@@ -203,10 +212,22 @@ export default function Dashboard() {
                               onClick={() => startAssessment(skill, level)}
                               className="btn btn-gradient-blue btn-sm"
                               disabled={!enabled}
-                              title={enabled ? '' : `Complete previous level before ${level}`}
+                              title={
+                                enabled
+                                  ? ''
+                                  : lockedByHighScore
+                                    ? `Locked: already scored ${bestScore}% in ${level}`
+                                    : `Complete previous level before ${level}`
+                              }
                             >
-                              {attempts > 0 ? `Reattempt ${level}` : `Take ${level}`}
-                              {attempts > 0 ? ` (${bestScore}%)` : ''}
+                              {lockedByHighScore
+                                ? `Locked ${level}`
+                                : attempts > 0
+                                  ? `Reattempt ${level}`
+                                  : `Take ${level}`}
+                              {` (${attempts} attempt${attempts !== 1 ? 's' : ''}`}
+                              {attempts > 0 ? `, best ${bestScore}%` : ''}
+                              {`)`}
                             </button>
                           );
                         })}
@@ -258,54 +279,6 @@ export default function Dashboard() {
                   </div>
                 ))}
               </div>
-            </div>
-          </div>
-
-          <div className="col-12">
-            <div className="card-modern p-4">
-              <div className="d-flex justify-content-between align-items-center mb-3">
-                <h5 className="mb-0">Learning Resources</h5>
-                <button
-                  className="btn btn-outline-primary btn-sm"
-                  onClick={() => setShowLearningResources((prev) => !prev)}
-                >
-                  {showLearningResources ? 'Hide' : 'Show'}
-                </button>
-              </div>
-
-              {learningMaterials && learningMaterials.missingSkillsCount > 0 ? (
-                <>
-                  <p className="text-muted">
-                    You have {learningMaterials.missingSkillsCount} missing skills. Use these curated resources.
-                  </p>
-                  {showLearningResources && (
-                    <div className="row g-3">
-                      {learningMaterials.materials?.map((material, idx) => (
-                        <div key={idx} className="col-12 col-md-6">
-                          <div className="border rounded-3 p-3 h-100">
-                            <h6>{material.skill}</h6>
-                            <div className="d-flex flex-column gap-2">
-                              {material.resources?.map((resource, ridx) => (
-                                <a
-                                  key={ridx}
-                                  href={resource.url}
-                                  target="_blank"
-                                  rel="noopener noreferrer"
-                                  className="text-decoration-none"
-                                >
-                                  {resource.type}: {resource.title}
-                                </a>
-                              ))}
-                            </div>
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </>
-              ) : (
-                <p className="text-muted mb-0">No learning resources required right now. Great progress!</p>
-              )}
             </div>
           </div>
         </div>

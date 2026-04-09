@@ -58,6 +58,10 @@ const recommendationSchema = new mongoose.Schema(
     // Selection tracking
     selected: { type: Boolean, default: false },
     selectedAt: Date,
+    accepted: { type: Boolean, default: false },
+    acceptedAt: Date,
+    rejected: { type: Boolean, default: false },
+    rejectedAt: Date,
     rank: Number, // 1st, 2nd, 3rd recommendation
 
     createdAt: { type: Date, default: Date.now, index: true },

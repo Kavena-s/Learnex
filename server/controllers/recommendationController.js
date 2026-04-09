@@ -6,6 +6,29 @@ const Interest = require("../models/Interest");
 const scoringService = require("../services/aiRecommendationService");
 const config = require("../config/recommendationConfig");
 
+let legacyRecommendationIndexChecked = false;
+
+async function ensureLegacyRecommendationIndexRemoved() {
+  if (legacyRecommendationIndexChecked) return;
+
+  const legacyIndexName = "userId_1_roleRecommended_1";
+
+  try {
+    const indexes = await Recommendation.collection.indexes();
+    const hasLegacyIndex = indexes.some((idx) => idx.name === legacyIndexName);
+
+    if (hasLegacyIndex) {
+      await Recommendation.collection.dropIndex(legacyIndexName);
+      console.log(`Dropped legacy recommendation index: ${legacyIndexName}`);
+    }
+  } catch (error) {
+    // Non-fatal: recommendation insert may still work if index is absent or cannot be read yet.
+    console.warn("Legacy index cleanup skipped:", error?.message || error);
+  } finally {
+    legacyRecommendationIndexChecked = true;
+  }
+}
+
 /**
  * IMPROVED ALGORITHM: Calculate weighted match score with CGPA awareness
  * Scoring components:
@@ -308,18 +331,41 @@ exports.generateRecommendations = async (req, res) => {
       await student.save();
     }
 
+    if (student.selectedRole?.roleId && !student.selectedRole?.finalAssessmentPassed) {
+      return res.status(409).json({
+        message: "You already selected a career path. Complete and pass final assessment before generating recommendations for another role.",
+      });
+    }
+
     const roles = await Role.find()
       .populate("requiredSkills", "_id name")
       .populate("preferredSkills", "_id name")
       .populate("relatedInterests", "_id name");
 
+    const qualifiedRoleIds = new Set(
+      (student.qualifiedRoles || [])
+        .map((entry) => String(entry?.roleId || ""))
+        .filter(Boolean)
+    );
+    if (student.selectedRole?.roleId && student.selectedRole?.finalAssessmentPassed) {
+      qualifiedRoleIds.add(String(student.selectedRole.roleId));
+    }
+
     // Only consider faculty-configured roles with at least one required skill.
     const rolesWithData = roles.filter(
-      (role) => Array.isArray(role.requiredSkills) && role.requiredSkills.length > 0
+      (role) => (
+        Array.isArray(role.requiredSkills) &&
+        role.requiredSkills.length > 0 &&
+        !qualifiedRoleIds.has(String(role._id))
+      )
     );
 
     if (!rolesWithData.length) {
-      return res.status(404).json({ message: "No career paths configured by faculty" });
+      return res.status(404).json({
+        message: qualifiedRoleIds.size > 0
+          ? "No new career paths available. You already qualified the configured roles."
+          : "No career paths configured by faculty",
+      });
     }
 
     const roleScores = rolesWithData.map((role) => {
@@ -405,12 +451,17 @@ exports.generateRecommendations = async (req, res) => {
         explanation,
         rank: index + 1,
         selected: false,
+        accepted: false,
+        acceptedAt: null,
+        rejected: false,
+        rejectedAt: null,
         recommendedTrack: null,
       };
     });
 
-    // Delete old recommendations and save new ones
-    await Recommendation.deleteMany({ userId });
+    // Keep accepted history immutable; refresh only non-accepted recommendations.
+    await ensureLegacyRecommendationIndexRemoved();
+    await Recommendation.deleteMany({ userId, accepted: { $ne: true } });
     const savedRecommendations = await Recommendation.insertMany(topRecommendations);
 
     res.status(201).json({
@@ -420,7 +471,28 @@ exports.generateRecommendations = async (req, res) => {
     });
   } catch (error) {
     console.error("Recommendation generation error:", error);
-    res.status(500).json({ message: "Failed to generate recommendations." });
+
+    if (error?.name === "CastError") {
+      return res.status(400).json({
+        message:
+          "Recommendation data is misconfigured (invalid skill/interest/role references). Ask faculty/admin to review career path data.",
+      });
+    }
+
+    if (error?.name === "ValidationError") {
+      return res.status(400).json({
+        message:
+          "Recommendation data failed validation. Ask faculty/admin to review role configuration.",
+      });
+    }
+
+    const includeDetails = process.env.NODE_ENV !== "production";
+    const baseMessage = "Failed to generate recommendations.";
+    return res.status(500).json({
+      message: includeDetails && error?.message
+        ? `${baseMessage} ${error.message}`
+        : baseMessage,
+    });
   }
 };
 
@@ -471,6 +543,11 @@ exports.selectRole = async (req, res) => {
     const userId = req.user.id;
     const { recommendationId } = req.params;
 
+    const student = await StudentProfile.findOne({ userId });
+    if (!student) {
+      return res.status(404).json({ message: "Student profile not found" });
+    }
+
     const recommendation = await Recommendation.findOne({
       _id: recommendationId,
       userId,
@@ -482,17 +559,56 @@ exports.selectRole = async (req, res) => {
       });
     }
 
+    if (student.selectedRole?.roleId && !student.selectedRole?.finalAssessmentPassed) {
+      if (String(student.selectedRole.roleId) === String(recommendation.roleId)) {
+        return res.status(200).json({
+          message: "Role already selected. Continue with assessments for this path.",
+          recommendation,
+          selectedRole: student.selectedRole,
+        });
+      }
+
+      return res.status(409).json({
+        message: "You already selected a role. Complete and pass final assessment before choosing another path.",
+      });
+    }
+
+    if (recommendation.rejected) {
+      return res.status(400).json({
+        message: "This recommendation was rejected. Generate recommendations again to get fresh options.",
+      });
+    }
+
+    if (
+      student.selectedRole?.roleId &&
+      student.selectedRole?.finalAssessmentPassed &&
+      String(student.selectedRole.roleId) === String(recommendation.roleId)
+    ) {
+      return res.status(400).json({
+        message: "This role is already your qualified path. Choose another recommendation.",
+      });
+    }
+
+    await Recommendation.updateMany({ userId }, { $set: { selected: false, selectedAt: null } });
+
     recommendation.selected = true;
     recommendation.selectedAt = new Date();
+    recommendation.accepted = true;
+    recommendation.acceptedAt = new Date();
+    recommendation.rejected = false;
+    recommendation.rejectedAt = null;
     await recommendation.save();
 
-    const student = await StudentProfile.findOne({ userId });
     student.selectedRole = {
       roleId: recommendation.roleId,
       trackIndex: recommendation.trackIndex || 0,
       trackName: recommendation.trackName || null,
       lockedAt: new Date(),
       canChange: true,
+      finalAssessmentPassed: false,
+      qualifiedAt: null,
+      qualifiedBy: null,
+      qualificationAssessmentId: null,
     };
     await student.save();
 
@@ -504,6 +620,55 @@ exports.selectRole = async (req, res) => {
   } catch (error) {
     console.error("Select role error:", error);
     res.status(500).json({ message: "Failed to select role" });
+  }
+};
+
+/**
+ * Student rejects a recommendation
+ * PUT /api/recommend/:recommendationId/reject
+ */
+exports.rejectRecommendation = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { recommendationId } = req.params;
+
+    const recommendation = await Recommendation.findOne({
+      _id: recommendationId,
+      userId,
+    });
+
+    if (!recommendation) {
+      return res.status(404).json({
+        message: "Recommendation not found or does not belong to you",
+      });
+    }
+
+    if (recommendation.accepted || recommendation.selected) {
+      return res.status(400).json({
+        message: "Accepted recommendation cannot be rejected or deleted.",
+      });
+    }
+
+    if (recommendation.rejected) {
+      return res.status(200).json({
+        message: "Recommendation already rejected",
+        recommendation,
+      });
+    }
+
+    recommendation.rejected = true;
+    recommendation.rejectedAt = new Date();
+    recommendation.selected = false;
+    recommendation.selectedAt = null;
+    await recommendation.save();
+
+    return res.json({
+      message: "Recommendation rejected",
+      recommendation,
+    });
+  } catch (error) {
+    console.error("Reject recommendation error:", error);
+    return res.status(500).json({ message: "Failed to reject recommendation" });
   }
 };
 

@@ -5,6 +5,7 @@
 
 const config = require('../config/recommendationConfig');
 const QuestionBank = require('../models/QuestionBank');
+const QuestionTopic = require('../models/QuestionTopic');
 
 function shuffleArray(items) {
   const arr = Array.isArray(items) ? [...items] : [];
@@ -26,6 +27,13 @@ function shuffleQuestionOptions(question) {
     options: shuffled.map((item) => item.option),
     correctAnswer: newCorrectAnswer >= 0 ? newCorrectAnswer : question.correctAnswer,
   };
+}
+
+function normalizeQuestionText(text) {
+  return String(text || '')
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 /**
@@ -299,8 +307,112 @@ async function generateQuestions(skillName, level, count = 10, previousQuestions
 
     console.log(`[QuestionGeneration] Found ${dbQuestions.length} approved DB questions for ${normalizedSkill} (${level})`);
 
-    const shuffledDb = shuffleArray(dbQuestions);
-    const selected = shuffledDb.slice(0, Math.min(count, shuffledDb.length));
+    // Enforce topic-level specificity: only serve questions mapped to active topics for this skill+level.
+    const activeTopics = await QuestionTopic.find({
+      skillName: { $regex: `^${normalizedSkill.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, $options: 'i' },
+      difficultyLevel: level,
+      isActive: true,
+    }).select('_id name');
+
+    let topicFilteredQuestions = dbQuestions;
+    if (activeTopics.length > 0) {
+      const topicIdSet = new Set(activeTopics.map((t) => String(t._id)));
+      const topicNameSet = new Set(activeTopics.map((t) => String(t.name || '').trim().toLowerCase()));
+
+      topicFilteredQuestions = dbQuestions.filter((q) => {
+        const qTopicId = q.topicId ? String(q.topicId) : null;
+        const qTopicName = String(q.topicName || '').trim().toLowerCase();
+        return (qTopicId && topicIdSet.has(qTopicId)) || (qTopicName && topicNameSet.has(qTopicName));
+      });
+
+      if (topicFilteredQuestions.length === 0) {
+        throw new Error(
+          `No approved questions mapped to active topics for ${normalizedSkill} (${level}). Please map question topics correctly in Question Bank.`
+        );
+      }
+    }
+
+    console.log(`[QuestionGeneration] After topic+level filter: ${topicFilteredQuestions.length} questions`);
+
+    // Remove duplicate question texts from pool.
+    const uniqueByTextMap = new Map();
+    topicFilteredQuestions.forEach((q) => {
+      const key = normalizeQuestionText(q.questionText);
+      if (key && !uniqueByTextMap.has(key)) {
+        uniqueByTextMap.set(key, q);
+      }
+    });
+    const uniquePool = Array.from(uniqueByTextMap.values());
+
+    // Filter out previously used questions to avoid duplicates
+    const previousQuestionTexts = new Set(
+      previousQuestions.map(q => normalizeQuestionText(q.questionText)).filter(Boolean)
+    );
+    const newQuestions = uniquePool.filter(q => {
+      const qText = normalizeQuestionText(q.questionText);
+      return !previousQuestionTexts.has(qText);
+    });
+
+    console.log(`[QuestionGeneration] After filtering duplicates: ${newQuestions.length} unique questions available`);
+
+    // Prefer fresh questions, but allow reuse of approved questions when pool is exhausted.
+    const candidateQuestions = newQuestions.length > 0 ? newQuestions : uniquePool;
+
+    if (candidateQuestions.length === 0) {
+      throw new Error(
+        `No approved questions available for ${normalizedSkill} (${level}). Please add approved topic-mapped questions.`
+      );
+    }
+
+    if (newQuestions.length === 0) {
+      console.warn(
+        `[QuestionGeneration] Fresh question pool exhausted for ${normalizedSkill} (${level}); reusing approved questions to avoid blocking assessments.`
+      );
+    }
+
+    // Topic-balanced selection to improve coverage across specific topics.
+    const topicBuckets = new Map();
+    candidateQuestions.forEach((q) => {
+      const topicKey = String(q.topicName || q.concept || 'General').trim() || 'General';
+      if (!topicBuckets.has(topicKey)) topicBuckets.set(topicKey, []);
+      topicBuckets.get(topicKey).push(q);
+    });
+    topicBuckets.forEach((arr, key) => {
+      topicBuckets.set(key, shuffleArray(arr));
+    });
+
+    const selected = [];
+    const topicKeys = shuffleArray(Array.from(topicBuckets.keys()));
+    while (selected.length < count) {
+      let pickedInThisRound = false;
+      for (const key of topicKeys) {
+        if (selected.length >= count) break;
+        const bucket = topicBuckets.get(key);
+        if (bucket && bucket.length > 0) {
+          selected.push(bucket.pop());
+          pickedInThisRound = true;
+        }
+      }
+      if (!pickedInThisRound) break;
+    }
+
+    // If fresh questions are insufficient, reuse older unique questions to keep exam size consistent.
+    if (selected.length < count) {
+      const selectedTextSet = new Set(selected.map((q) => normalizeQuestionText(q.questionText)));
+      const fallbackPool = shuffleArray(
+        uniquePool.filter((q) => !selectedTextSet.has(normalizeQuestionText(q.questionText)))
+      );
+
+      while (selected.length < count && fallbackPool.length > 0) {
+        selected.push(fallbackPool.pop());
+      }
+    }
+
+    if (selected.length < count) {
+      console.warn(
+        `[QuestionGeneration] Requested ${count} questions but only ${selected.length} unique approved questions exist for ${normalizedSkill} (${level})`
+      );
+    }
 
     const normalized = selected.map(q => ({
       questionText: q.questionText,

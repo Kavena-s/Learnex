@@ -9,6 +9,8 @@ const Assessment = require("../models/Assessment");
 const Role = require("../models/Role");
 const User = require("../models/User");
 const QuestionBank = require("../models/QuestionBank");
+require("../models/Skill");
+require("../models/Interest");
 
 /**
  * Get domain/role popularity metrics
@@ -16,7 +18,7 @@ const QuestionBank = require("../models/QuestionBank");
  */
 async function getDomainPopularity() {
   try {
-    const recommendations = await Recommendation.aggregate([
+    let recommendations = await Recommendation.aggregate([
       {
         $match: { $or: [{ selected: true }, { isSelected: true }] },
       },
@@ -33,7 +35,7 @@ async function getDomainPopularity() {
       },
       {
         $group: {
-          _id: "$role.domain",
+          _id: { $ifNull: ["$role.domain", "Unspecified"] },
           count: { $sum: 1 },
           roles: {
             $push: {
@@ -49,7 +51,7 @@ async function getDomainPopularity() {
     ]);
 
     // Also get role-level breakdown
-    const rolePopularity = await Recommendation.aggregate([
+    let rolePopularity = await Recommendation.aggregate([
       {
         $match: { $or: [{ selected: true }, { isSelected: true }] },
       },
@@ -75,7 +77,7 @@ async function getDomainPopularity() {
           _id: 1,
           count: 1,
           roleName: "$role.roleName",
-          domain: "$role.domain",
+          domain: { $ifNull: ["$role.domain", "Unspecified"] },
         },
       },
       {
@@ -85,6 +87,84 @@ async function getDomainPopularity() {
         $limit: 10,
       },
     ]);
+
+    // Fallback: if selected recommendation flags are missing, use selected roles from profiles.
+    if (!rolePopularity.length) {
+      rolePopularity = await StudentProfile.aggregate([
+        {
+          $match: {
+            "selectedRole.roleId": { $exists: true, $ne: null },
+          },
+        },
+        {
+          $group: {
+            _id: "$selectedRole.roleId",
+            count: { $sum: 1 },
+          },
+        },
+        {
+          $lookup: {
+            from: "roles",
+            localField: "_id",
+            foreignField: "_id",
+            as: "role",
+          },
+        },
+        { $unwind: "$role" },
+        {
+          $project: {
+            _id: 1,
+            count: 1,
+            roleName: "$role.roleName",
+            domain: { $ifNull: ["$role.domain", "Unspecified"] },
+          },
+        },
+        { $sort: { count: -1 } },
+        { $limit: 10 },
+      ]);
+
+    }
+
+    // Enrich legacy roles that don't have domain populated yet.
+    const missingDomainRoleIds = rolePopularity
+      .filter((r) => !r.domain || String(r.domain).trim().toLowerCase() === "unspecified")
+      .map((r) => r._id)
+      .filter(Boolean);
+
+    if (missingDomainRoleIds.length > 0) {
+      const legacyRoles = await Role.find({ _id: { $in: missingDomainRoleIds } })
+        .populate("relatedInterests", "name")
+        .select("_id domain relatedInterests")
+        .lean();
+
+      const legacyDomainByRoleId = new Map();
+      legacyRoles.forEach((role) => {
+        const explicitDomain = String(role?.domain || "").trim();
+        const derivedDomain = String(role?.relatedInterests?.[0]?.name || "").trim();
+        legacyDomainByRoleId.set(
+          String(role._id),
+          explicitDomain || derivedDomain || "Unspecified"
+        );
+      });
+
+      rolePopularity = rolePopularity.map((roleStat) => ({
+        ...roleStat,
+        domain: legacyDomainByRoleId.get(String(roleStat._id)) || roleStat.domain || "Unspecified",
+      }));
+    }
+
+    // Keep byDomain aligned with topRoles after normalization/enrichment.
+    const domainMap = new Map();
+    rolePopularity.forEach((r) => {
+      const domainKey = String(r.domain || "Unspecified");
+      if (!domainMap.has(domainKey)) {
+        domainMap.set(domainKey, { _id: domainKey, count: 0, roles: [] });
+      }
+      const entry = domainMap.get(domainKey);
+      entry.count += Number(r.count) || 0;
+      entry.roles.push({ roleName: r.roleName, roleId: r._id });
+    });
+    recommendations = Array.from(domainMap.values()).sort((a, b) => b.count - a.count);
 
     return {
       byDomain: recommendations,
@@ -102,13 +182,34 @@ async function getDomainPopularity() {
  */
 async function getSkillGapTrends() {
   try {
-    const recommendations = await Recommendation.find({
+    let recommendations = await Recommendation.find({
       $or: [{ selected: true }, { isSelected: true }]
     }).populate({
       path: "roleId",
       select: "requiredSkills",
       populate: { path: "requiredSkills", select: "name" },
     });
+
+    // Fallback: if recommendation selection flags are unavailable, use selected roles in profiles.
+    if (!recommendations.length) {
+      const selectedProfiles = await StudentProfile.find({
+        "selectedRole.roleId": { $exists: true, $ne: null },
+      })
+        .populate({
+          path: "selectedRole.roleId",
+          select: "requiredSkills",
+          populate: { path: "requiredSkills", select: "name" },
+        })
+        .select("userId selectedRole")
+        .lean();
+
+      recommendations = selectedProfiles
+        .map((profile) => ({
+          userId: profile.userId,
+          roleId: profile.selectedRole?.roleId,
+        }))
+        .filter((entry) => entry.roleId);
+    }
 
     const userIds = recommendations
       .map((rec) => rec.userId || rec.studentId)
@@ -185,9 +286,24 @@ async function getSkillGapTrends() {
  */
 async function getReadinessMetrics() {
   try {
-    const recommendations = await Recommendation.find({
+    let recommendations = await Recommendation.find({
       $or: [{ selected: true }, { isSelected: true }]
     });
+
+    // Fallback: when selected flags are not set, use latest recommendation per student.
+    if (!recommendations.length) {
+      const latestByUser = await Recommendation.aggregate([
+        { $sort: { createdAt: -1 } },
+        {
+          $group: {
+            _id: "$userId",
+            rec: { $first: "$$ROOT" },
+          },
+        },
+        { $replaceRoot: { newRoot: "$rec" } },
+      ]);
+      recommendations = latestByUser;
+    }
 
     if (recommendations.length === 0) {
       return {
@@ -240,19 +356,21 @@ async function getReadinessMetrics() {
  */
 async function getAssessmentMetrics() {
   try {
-    // Get adaptive assessment stats
-    const adaptiveAssessments = await Assessment.find({
-      type: "self-paced",
+    // Final assessment performance only (faculty-scheduled outcome metrics).
+    const finalAssessments = await Assessment.find({
+      type: "faculty-scheduled",
+      skillName: { $regex: "^final assessment$", $options: "i" },
       status: { $in: ["completed", "reviewed"] },
-      score: { $exists: true },
     });
 
-    const passThreshold = 60; // 60% to pass
+    const passedCount = finalAssessments.filter((a) => a.result === "passed").length;
+    const failedCount = finalAssessments.filter((a) => a.result === "needs_improvement").length;
+    const scoredFinalAssessments = finalAssessments.filter((a) => typeof a.score === "number");
 
     const metrics = {
-      totalAttempts: adaptiveAssessments.length,
-      passed: adaptiveAssessments.filter((a) => a.score >= passThreshold).length,
-      failed: adaptiveAssessments.filter((a) => a.score < passThreshold).length,
+      totalAttempts: finalAssessments.length,
+      passed: passedCount,
+      failed: failedCount,
       averageScore: 0,
       passRate: 0,
       byLevel: {
@@ -263,28 +381,33 @@ async function getAssessmentMetrics() {
       bySkill: {},
     };
 
-    if (adaptiveAssessments.length > 0) {
-      const totalScore = adaptiveAssessments.reduce((sum, a) => sum + a.score, 0);
-      metrics.averageScore = Math.round(totalScore / adaptiveAssessments.length);
+    if (finalAssessments.length > 0) {
+      if (scoredFinalAssessments.length > 0) {
+        const totalScore = scoredFinalAssessments.reduce((sum, a) => sum + a.score, 0);
+        metrics.averageScore = Math.round(totalScore / scoredFinalAssessments.length);
+      }
       metrics.passRate = Math.round((metrics.passed / metrics.totalAttempts) * 100);
 
       // By level
       ["beginner", "intermediate", "advanced"].forEach((level) => {
-        const levelAssessments = adaptiveAssessments.filter((a) => a.level === level);
+        const levelAssessments = finalAssessments.filter((a) => a.level === level);
         if (levelAssessments.length > 0) {
           metrics.byLevel[level].total = levelAssessments.length;
           metrics.byLevel[level].passed = levelAssessments.filter(
-            (a) => a.score >= passThreshold
+            (a) => a.result === "passed"
           ).length;
-          const levelTotal = levelAssessments.reduce((sum, a) => sum + a.score, 0);
-          metrics.byLevel[level].averageScore = Math.round(
-            levelTotal / levelAssessments.length
-          );
+          const levelWithScore = levelAssessments.filter((a) => typeof a.score === "number");
+          if (levelWithScore.length > 0) {
+            const levelTotal = levelWithScore.reduce((sum, a) => sum + a.score, 0);
+            metrics.byLevel[level].averageScore = Math.round(
+              levelTotal / levelWithScore.length
+            );
+          }
         }
       });
 
       // By skill
-      adaptiveAssessments.forEach((a) => {
+      finalAssessments.forEach((a) => {
         if (!metrics.bySkill[a.skillName]) {
           metrics.bySkill[a.skillName] = {
             total: 0,
@@ -293,20 +416,21 @@ async function getAssessmentMetrics() {
           };
         }
         metrics.bySkill[a.skillName].total++;
-        if (a.score >= passThreshold) {
+        if (a.result === "passed") {
           metrics.bySkill[a.skillName].passed++;
         }
       });
 
       // Calculate average per skill
       Object.keys(metrics.bySkill).forEach((skill) => {
-        const skillAssessments = adaptiveAssessments.filter(
-          (a) => a.skillName === skill
-        );
-        const skillTotal = skillAssessments.reduce((sum, a) => sum + a.score, 0);
-        metrics.bySkill[skill].averageScore = Math.round(
-          skillTotal / skillAssessments.length
-        );
+        const skillAssessments = finalAssessments.filter((a) => a.skillName === skill);
+        const skillWithScore = skillAssessments.filter((a) => typeof a.score === "number");
+        if (skillWithScore.length > 0) {
+          const skillTotal = skillWithScore.reduce((sum, a) => sum + a.score, 0);
+          metrics.bySkill[skill].averageScore = Math.round(
+            skillTotal / skillWithScore.length
+          );
+        }
       });
     }
 

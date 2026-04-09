@@ -3,6 +3,7 @@ import axios from 'axios';
 import { useAuth } from '../../context/AuthContext';
 import FacultyLayout from '../../components/FacultyLayout';
 import authService from '../../services/authService';
+import useAutoRefresh from '../../hooks/useAutoRefresh';
 
 const LEVELS = ['beginner', 'intermediate', 'advanced'];
 const REQUIRED_ASSESSMENT_COUNT = 10;
@@ -69,8 +70,8 @@ export default function FacultyQuestionBank() {
     }
   };
 
-  const fetchQuestions = async () => {
-    setLoadingQuestions(true);
+  const fetchQuestions = async ({ silent = false } = {}) => {
+    if (!silent) setLoadingQuestions(true);
     try {
       const params = {
         skillName: selectedSkill,
@@ -81,9 +82,16 @@ export default function FacultyQuestionBank() {
     } catch (err) {
       console.error('Failed to fetch questions:', err);
     } finally {
-      setLoadingQuestions(false);
+      if (!silent) setLoadingQuestions(false);
     }
   };
+
+  useAutoRefresh(async ({ silent = true } = {}) => {
+    await fetchSkills();
+    if (selectedSkill) {
+      await fetchQuestions({ silent });
+    }
+  }, { intervalMs: 30000 });
 
   const resetQuestionForm = () => {
     setEditingQuestionId('');

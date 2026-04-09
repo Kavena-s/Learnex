@@ -5,6 +5,30 @@ const Interest = require("../models/Interest");
 const Domain = require("../models/Domain");
 const learningMaterialsService = require("../services/learningMaterialsService");
 
+function normalizeIdList(list) {
+  return (Array.isArray(list) ? list : [])
+    .map((item) => String(item || "").trim())
+    .filter(Boolean)
+    .sort();
+}
+
+function normalizeProjects(projects) {
+  return (Array.isArray(projects) ? projects : [])
+    .map((project) => ({
+      domain: String(project?.domain || "").trim(),
+      count: Number(project?.count) || 0,
+    }))
+    .filter((project) => project.domain)
+    .sort((a, b) => {
+      if (a.domain !== b.domain) return a.domain.localeCompare(b.domain);
+      return a.count - b.count;
+    });
+}
+
+function arraysEqual(a, b) {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
 /**
  * ============================================
  * PROFILE CONTROLLER
@@ -63,26 +87,97 @@ exports.saveProfile = async (req, res) => {
         profileComplete: true,
       });
     } else {
+      const existingName = String(profile.name || "");
+      const existingDepartment = String(profile.department || "");
+      const existingCGPA = Number(profile.cgpa ?? 0);
+      const existingPreferredDomain = String(profile.preferredDomain || "");
+      const existingSkills = normalizeIdList((profile.skills || []).map((id) => id?.toString?.() || id));
+      const existingInterests = normalizeIdList((profile.interests || []).map((id) => id?.toString?.() || id));
+      const existingProjects = normalizeProjects(profile.projectsDone || []);
+
+      const targetName = name !== undefined ? String(name || "") : existingName;
+      const targetDepartment = department !== undefined ? String(department || "") : existingDepartment;
+      const targetCGPA = cgpa !== undefined ? Number(cgpa) : existingCGPA;
+      const targetPreferredDomain = preferredDomain !== undefined
+        ? String(preferredDomain || "")
+        : existingPreferredDomain;
+      const targetSkills = skills !== undefined ? normalizeIdList(skills) : existingSkills;
+      const targetInterests = interests !== undefined ? normalizeIdList(interests) : existingInterests;
+      const targetProjects = projectsDone !== undefined ? normalizeProjects(projectsDone) : existingProjects;
+
+      const anyFieldChanged = (
+        targetName !== existingName ||
+        targetDepartment !== existingDepartment ||
+        targetCGPA !== existingCGPA ||
+        targetPreferredDomain !== existingPreferredDomain ||
+        !arraysEqual(targetSkills, existingSkills) ||
+        !arraysEqual(targetInterests, existingInterests) ||
+        !arraysEqual(targetProjects, existingProjects)
+      );
+
+      if (!anyFieldChanged) {
+        return res.status(200).json({
+          message: "No profile changes detected. Existing recommendations and assessments are unchanged.",
+          profile,
+          changed: false,
+        });
+      }
+
+      const recommendationDataChanged = (
+        targetCGPA !== existingCGPA ||
+        targetPreferredDomain !== existingPreferredDomain ||
+        !arraysEqual(targetSkills, existingSkills) ||
+        !arraysEqual(targetInterests, existingInterests) ||
+        !arraysEqual(targetProjects, existingProjects)
+      );
+
       // Update existing profile
-      if (name !== undefined) profile.name = name;
-      if (department !== undefined) profile.department = department;
-      if (cgpa !== undefined) profile.cgpa = cgpa;
-      if (preferredDomain !== undefined) profile.preferredDomain = preferredDomain;
-      // Allow empty arrays to clear previous selections: check for undefined only
-      if (skills !== undefined) profile.skills = skills;
-      if (interests !== undefined) profile.interests = interests;
-      if (projectsDone !== undefined) profile.projectsDone = projectsDone;
+      profile.name = targetName;
+      profile.department = targetDepartment;
+      profile.cgpa = targetCGPA;
+      profile.preferredDomain = targetPreferredDomain;
+      profile.skills = targetSkills;
+      profile.interests = targetInterests;
+      profile.projectsDone = targetProjects;
       profile.profileComplete = true;
+
+      if (recommendationDataChanged) {
+        const Recommendation = require("../models/Recommendation");
+        const Assessment = require("../models/Assessment");
+
+        await Promise.all([
+          Recommendation.deleteMany({ userId }),
+          Assessment.deleteMany({ studentId: userId }),
+        ]);
+
+        profile.selectedRole = {
+          roleId: null,
+          trackIndex: 0,
+          trackName: null,
+          lockedAt: null,
+          canChange: false,
+          finalAssessmentPassed: false,
+          qualifiedAt: null,
+          qualifiedBy: null,
+          qualificationAssessmentId: null,
+        };
+
+        profile.roadmapProgress = {
+          beginner: { completedTopics: [], progressPercentage: 0, completed: false, completedAt: null },
+          intermediate: { completedTopics: [], progressPercentage: 0, completed: false, completedAt: null },
+          advanced: { completedTopics: [], progressPercentage: 0, completed: false, completedAt: null },
+        };
+        profile.qualifiedSkills = [];
+        profile.qualifiedRoles = [];
+      }
+
       await profile.save();
     }
-
-    // whenever profile data changes we should invalidate past recommendations
-    const Recommendation = require("../models/Recommendation");
-    await Recommendation.deleteMany({ userId });
 
     res.status(200).json({
       message: "Profile saved successfully",
       profile,
+      changed: true,
     });
   } catch (error) {
     console.error("❌ Profile save error:", error);
@@ -221,6 +316,7 @@ exports.getAllProfiles = async (req, res) => {
       .populate("skills", "name category")
       .populate("interests", "name")
       .populate("selectedRole.roleId", "roleName")
+      .populate("qualifiedRoles.roleId", "roleName")
       .sort({ createdAt: -1 });
 
     res.json(profiles);

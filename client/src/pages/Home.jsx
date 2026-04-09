@@ -10,7 +10,12 @@ export default function Home() {
   const navigate = useNavigate();
   const [recommendations, setRecommendations] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [generating, setGenerating] = useState(false);
+  const [processingId, setProcessingId] = useState('');
   const [error, setError] = useState('');
+  const [selectionLock, setSelectionLock] = useState({ locked: false, roleName: '' });
+
+  const actionableRecommendations = recommendations.filter((r) => !r.accepted && !r.rejected && !r.selected);
 
   useEffect(() => {
     fetchRecommendations();
@@ -20,6 +25,20 @@ export default function Home() {
     const token = authService.getToken();
 
     try {
+      try {
+        const profileRes = await axios.get('http://localhost:5000/api/profile', {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        const selectedRole = profileRes.data?.selectedRole;
+        const locked = Boolean(selectedRole?.roleId) && !Boolean(selectedRole?.finalAssessmentPassed);
+        setSelectionLock({
+          locked,
+          roleName: selectedRole?.trackName || selectedRole?.roleId?.roleName || '',
+        });
+      } catch {
+        setSelectionLock({ locked: false, roleName: '' });
+      }
+
       const res = await axios.get('http://localhost:5000/api/recommend', {
         headers: { Authorization: `Bearer ${token}` }
       });
@@ -35,16 +54,8 @@ export default function Home() {
             navigate('/profile-setup');
             return;
           }
-
-          // Profile exists, so generate fresh recommendations if none are stored.
-          await axios.post('http://localhost:5000/api/recommend', {}, {
-            headers: { Authorization: `Bearer ${token}` }
-          });
-
-          const refreshed = await axios.get('http://localhost:5000/api/recommend', {
-            headers: { Authorization: `Bearer ${token}` }
-          });
-          setRecommendations(refreshed.data.recommendations || []);
+          setRecommendations([]);
+          setError('No recommendations generated yet. Click "Generate Recommendations" to continue.');
         } catch (fallbackErr) {
           if (fallbackErr.response?.status === 404 && fallbackErr.config?.url?.includes('/api/profile')) {
             navigate('/profile-setup');
@@ -66,15 +77,49 @@ export default function Home() {
     }
   };
 
+  const handleGenerateRecommendations = async () => {
+    setGenerating(true);
+    setError('');
+    try {
+      const token = authService.getToken();
+      await axios.post('http://localhost:5000/api/recommend', {}, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      await fetchRecommendations();
+    } catch (err) {
+      setError(err.response?.data?.message || 'Failed to generate recommendations');
+    } finally {
+      setGenerating(false);
+    }
+  };
+
   const handleAccept = async (recId) => {
     try {
+      setProcessingId(recId);
       const token = authService.getToken();
       await axios.put(`http://localhost:5000/api/recommend/${recId}/select`, {}, {
         headers: { Authorization: `Bearer ${token}` }
       });
       navigate('/dashboard');
     } catch (err) {
-      setError('Failed to accept recommendation');
+      setError(err.response?.data?.message || 'Failed to accept recommendation');
+    } finally {
+      setProcessingId('');
+    }
+  };
+
+  const handleReject = async (recId) => {
+    try {
+      setProcessingId(recId);
+      const token = authService.getToken();
+      await axios.put(`http://localhost:5000/api/recommend/${recId}/reject`, {}, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      await fetchRecommendations();
+    } catch (err) {
+      setError(err.response?.data?.message || 'Failed to reject recommendation');
+    } finally {
+      setProcessingId('');
     }
   };
 
@@ -114,8 +159,24 @@ export default function Home() {
           </div>
         )}
 
+        <div className="d-flex justify-content-center mb-4">
+          <button className="btn btn-gradient" onClick={handleGenerateRecommendations} disabled={generating || loading || selectionLock.locked}>
+            {generating ? 'Generating...' : 'Generate Recommendations'}
+          </button>
+        </div>
+
+        {selectionLock.locked && (
+          <div
+            className="alert border-0 rounded-4 mb-4 mx-auto"
+            style={{ maxWidth: '760px', background: 'rgba(255, 193, 7, 0.2)', color: '#ffe9b0' }}
+          >
+            <i className="bi bi-lock-fill me-2"></i>
+            You already selected <strong>{selectionLock.roleName || 'a career path'}</strong>. Complete and pass final assessment before accepting another recommendation.
+          </div>
+        )}
+
         <div className="row g-4">
-          {recommendations.slice(0, 2).map((rec, idx) => (
+          {actionableRecommendations.slice(0, 2).map((rec, idx) => (
             <div key={rec._id} className="col-12 col-md-6 col-lg-4">
               <div className="card-modern h-100 p-4 position-relative animate-fade-in-up">
                 {idx === 0 && (
@@ -161,16 +222,35 @@ export default function Home() {
                     </div>
                   </div>
 
-                  <button onClick={() => handleAccept(rec._id)} className="btn btn-gradient w-100 mt-auto">
-                    Choose This Path
-                  </button>
+                  {selectionLock.locked ? (
+                    <button className="btn btn-outline-secondary w-100 mt-auto" disabled>
+                      Locked Until Final Assessment Pass
+                    </button>
+                  ) : (
+                    <div className="d-flex gap-2 mt-auto">
+                      <button
+                        onClick={() => handleAccept(rec._id)}
+                        className="btn btn-gradient w-100"
+                        disabled={processingId === rec._id}
+                      >
+                        Accept
+                      </button>
+                      <button
+                        onClick={() => handleReject(rec._id)}
+                        className="btn btn-outline-danger w-100"
+                        disabled={processingId === rec._id}
+                      >
+                        Reject
+                      </button>
+                    </div>
+                  )}
                 </div>
               </div>
             </div>
           ))}
         </div>
 
-        {recommendations.length === 0 && !loading && !error && (
+        {actionableRecommendations.length === 0 && !loading && !error && (
           <div className="text-center py-5 animate-fade-in-up">
             <p className="display-6 mb-3 text-white">No recommendations found</p>
             <p className="text-white mb-4" style={{ opacity: 0.9 }}>Complete your profile to get personalized career recommendations</p>

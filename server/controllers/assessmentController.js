@@ -28,6 +28,12 @@ function shuffleQuestionOptions(question) {
 }
 
 const LEVEL_ORDER = ["beginner", "intermediate", "advanced"];
+const FINAL_ASSESSMENT_MIN_SCORE = 90; // Require 90+ score on all levels
+const QUESTIONS_PER_ASSESSMENT = 10;
+
+function escapeRegex(text) {
+  return String(text || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
 
 function getPreviousLevel(level) {
   const idx = LEVEL_ORDER.indexOf(level);
@@ -35,15 +41,19 @@ function getPreviousLevel(level) {
   return LEVEL_ORDER[idx - 1];
 }
 
+function normalizeSkillName(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
 /**
  * Student requests an assessment for a specific level
- * POST /api/faculty/assessments/request
- * Body: { roleId, level }
+ * POST /api/assessments
+ * Body: { roleId, level, skillName? }
  */
 exports.requestAssessment = async (req, res) => {
   try {
     const studentId = req.user.id;
-    const { roleId, level } = req.body;
+    const { roleId, level, skillName } = req.body;
 
     // Validate inputs
     if (!roleId || !level) {
@@ -57,15 +67,35 @@ exports.requestAssessment = async (req, res) => {
     }
 
     // Check if role exists
-    const role = await Role.findById(roleId);
+    const role = await Role.findById(roleId).populate("requiredSkills", "name");
     if (!role) {
       return res.status(404).json({ message: "Role not found" });
     }
 
-    // Check if student already has pending/scheduled assessment for this level
+    let resolvedSkillName = String(skillName || "").trim();
+    if (!resolvedSkillName) {
+      const requiredSkillNames = (role.requiredSkills || [])
+        .map((s) => String(s?.name || "").trim())
+        .filter(Boolean);
+
+      if (requiredSkillNames.length === 1) {
+        resolvedSkillName = requiredSkillNames[0];
+      } else {
+        return res.status(400).json({
+          message:
+            "skillName is required for this role. Provide one required skill to request assessment.",
+        });
+      }
+    }
+
+    // Check if student already has pending/scheduled assessment for this skill + level.
     const existing = await Assessment.findOne({
       studentId,
       roleId,
+      skillName: {
+        $regex: `^${escapeRegex(resolvedSkillName)}$`,
+        $options: "i",
+      },
       level,
       status: { $in: ["requested", "scheduled"] },
     });
@@ -80,6 +110,7 @@ exports.requestAssessment = async (req, res) => {
     const assessment = await Assessment.create({
       studentId,
       roleId,
+      skillName: resolvedSkillName,
       level,
       status: "requested",
       type: "faculty-scheduled",
@@ -147,24 +178,35 @@ exports.getAssessmentRequests = async (req, res) => {
 exports.scheduleAssessment = async (req, res) => {
   try {
     const { assessmentId } = req.params;
-    const { scheduledDate, mode } = req.body;
+    const { scheduledDate, timeSlot } = req.body;
 
     // Validate inputs
-    if (!scheduledDate || !mode) {
+    if (!scheduledDate || !timeSlot) {
       return res
         .status(400)
-        .json({ message: "scheduledDate and mode (online/offline) are required" });
+        .json({ message: "scheduledDate (YYYY-MM-DD) and timeSlot (FN or AN) are required" });
     }
 
-    if (!["online", "offline"].includes(mode)) {
-      return res.status(400).json({ message: "Invalid mode. Use 'online' or 'offline'" });
+    // Validate date format
+    const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
+    if (!dateRegex.test(scheduledDate)) {
+      return res.status(400).json({ message: "Invalid date format. Use YYYY-MM-DD" });
     }
+
+    const slot = String(timeSlot).toUpperCase().trim();
+    if (!['FN', 'AN'].includes(slot)) {
+      return res.status(400).json({ message: "Invalid timeSlot. Use 'FN' (Forenoon) or 'AN' (Afternoon)" });
+    }
+
+    // Parse the date and add time
+    const dateObj = new Date(scheduledDate + 'T00:00:00');
+    dateObj.setHours(slot === 'FN' ? 9 : 14, 0, 0, 0);
 
     // Check if date is in future
-    if (new Date(scheduledDate) <= new Date()) {
+    if (dateObj <= new Date()) {
       return res
         .status(400)
-        .json({ message: "Scheduled date must be in the future" });
+        .json({ message: "Scheduled date/time must be in the future" });
     }
 
     // Find and update assessment
@@ -180,8 +222,9 @@ exports.scheduleAssessment = async (req, res) => {
     }
 
     assessment.status = "scheduled";
-    assessment.scheduledDate = new Date(scheduledDate);
-    assessment.mode = mode;
+    assessment.scheduledDate = dateObj;
+    assessment.timeSlot = slot;
+    assessment.mode = "online";
     await assessment.save();
 
     // Populate relationships for response
@@ -194,7 +237,11 @@ exports.scheduleAssessment = async (req, res) => {
     });
   } catch (error) {
     console.error("Schedule assessment error:", error);
-    res.status(500).json({ message: "Failed to schedule assessment" });
+    res.status(500).json({
+      message: "Failed to schedule assessment",
+      error: error.message,
+      details: error.message || "Unknown server error"
+    });
   }
 };
 
@@ -207,6 +254,7 @@ exports.completeAssessment = async (req, res) => {
   try {
     const { assessmentId } = req.params;
     const { result, adminNotes, facultyNotes } = req.body;
+    const facultyId = req.user.id;
 
     // Validate inputs
     if (!result || !["passed", "needs_improvement"].includes(result)) {
@@ -234,14 +282,83 @@ exports.completeAssessment = async (req, res) => {
     assessment.completedAt = new Date();
     await assessment.save();
 
+    const isFinalAssessment = /^final assessment$/i.test(String(assessment.skillName || "").trim());
+
     // If passed, update student roadmap progress
     if (result === "passed") {
       const student = await StudentProfile.findOne({
         userId: assessment.studentId,
       });
-      if (student && student.roadmapProgress[assessment.level]) {
+      if (student && !isFinalAssessment && student.roadmapProgress[assessment.level]) {
         student.roadmapProgress[assessment.level].completed = true;
         student.roadmapProgress[assessment.level].completedAt = new Date();
+        await student.save();
+      }
+
+      // Final role qualification happens only after final assessment is passed.
+      if (student && isFinalAssessment && student.selectedRole?.roleId) {
+        const role = await Role.findById(student.selectedRole.roleId).populate("requiredSkills", "name");
+        const requiredSkillNames = (role?.requiredSkills || [])
+          .map((skill) => String(skill?.name || "").trim())
+          .filter(Boolean);
+
+        const finalScore = Number(assessment.score) || 100;
+        const levelRank = { beginner: 1, intermediate: 2, advanced: 3 };
+
+        requiredSkillNames.forEach((skillName) => {
+          const existingIndex = (student.qualifiedSkills || []).findIndex(
+            (q) => String(q.skillName || "").toLowerCase() === skillName.toLowerCase()
+          );
+
+          const payload = {
+            skillName,
+            level: "advanced",
+            score: finalScore,
+            qualifiedAt: new Date(),
+            qualifiedBy: facultyId,
+            sourceAssessmentId: assessment._id,
+          };
+
+          if (existingIndex >= 0) {
+            const existing = student.qualifiedSkills[existingIndex];
+            const existingLevelRank = levelRank[existing.level] || 0;
+            const existingScore = Number(existing.score) || 0;
+
+            if (existingLevelRank < levelRank.advanced || existingScore < finalScore) {
+              student.qualifiedSkills[existingIndex] = payload;
+            }
+          } else {
+            student.qualifiedSkills.push(payload);
+          }
+        });
+
+        student.selectedRole.finalAssessmentPassed = true;
+        student.selectedRole.qualifiedAt = new Date();
+        student.selectedRole.qualifiedBy = facultyId;
+        student.selectedRole.qualificationAssessmentId = assessment._id;
+
+        const qualifiedRolePayload = {
+          roleId: student.selectedRole.roleId,
+          roleName: role?.roleName || student.selectedRole.trackName || "Qualified Role",
+          trackName: student.selectedRole.trackName || null,
+          qualifiedAt: new Date(),
+          qualifiedBy: facultyId,
+          sourceAssessmentId: assessment._id,
+        };
+
+        if (!Array.isArray(student.qualifiedRoles)) {
+          student.qualifiedRoles = [];
+        }
+        const existingQualifiedRoleIndex = student.qualifiedRoles.findIndex(
+          (entry) => String(entry?.roleId || "") === String(student.selectedRole.roleId || "")
+        );
+
+        if (existingQualifiedRoleIndex >= 0) {
+          student.qualifiedRoles[existingQualifiedRoleIndex] = qualifiedRolePayload;
+        } else {
+          student.qualifiedRoles.push(qualifiedRolePayload);
+        }
+
         await student.save();
       }
     }
@@ -325,6 +442,13 @@ exports.qualifySkillFromAssessment = async (req, res) => {
       return res.status(400).json({ message: "Only skill assessments can be qualified" });
     }
 
+    const score = Number(assessment.score) || 0;
+    if (score < 90) {
+      return res.status(400).json({
+        message: "Only assessments with score 90 or above can be marked as qualified",
+      });
+    }
+
     const profile = await StudentProfile.findOne({ userId: assessment.studentId });
     if (!profile) {
       return res.status(404).json({ message: "Student profile not found" });
@@ -332,7 +456,7 @@ exports.qualifySkillFromAssessment = async (req, res) => {
 
     const levelOrder = { beginner: 1, intermediate: 2, advanced: 3 };
     const newLevelRank = levelOrder[assessment.level] || 0;
-    const newScore = Number(assessment.score) || 0;
+    const newScore = score;
 
     const existingIndex = (profile.qualifiedSkills || []).findIndex(
       (q) => String(q.skillName || "").toLowerCase() === skillName.toLowerCase()
@@ -439,9 +563,10 @@ exports.startAdaptiveAssessment = async (req, res) => {
   try {
     const studentId = req.user.id;
     const { skillName, level } = req.body;
+    const normalizedSkillName = String(skillName || "").trim();
 
     // Validate inputs
-    if (!skillName || !level) {
+    if (!normalizedSkillName || !level) {
       return res.status(400).json({ message: "skillName and level are required" });
     }
 
@@ -454,7 +579,10 @@ exports.startAdaptiveAssessment = async (req, res) => {
     if (previousLevel) {
       const previousCompletion = await Assessment.findOne({
         studentId,
-        skillName,
+        skillName: {
+          $regex: `^${escapeRegex(normalizedSkillName)}$`,
+          $options: "i",
+        },
         level: previousLevel,
         status: "completed",
       })
@@ -468,24 +596,74 @@ exports.startAdaptiveAssessment = async (req, res) => {
       }
     }
 
+    // Stop reattempts once student has already mastered this skill level (90+).
+    const masteredAttempt = await Assessment.findOne({
+      studentId,
+      skillName: {
+        $regex: `^${escapeRegex(normalizedSkillName)}$`,
+        $options: "i",
+      },
+      level,
+      status: "completed",
+      score: { $gte: FINAL_ASSESSMENT_MIN_SCORE },
+    })
+      .sort({ createdAt: -1 })
+      .select("_id score");
+
+    if (masteredAttempt) {
+      return res.status(400).json({
+        message: `Reattempt not allowed. You already scored ${masteredAttempt.score}% in ${skillName} (${level}).`,
+      });
+    }
+
     // Check for active assessment on this skill (integrity: one attempt at a time)
     const activeAssessment = await Assessment.findOne({
       studentId,
-      skillName,
+      skillName: {
+        $regex: `^${escapeRegex(normalizedSkillName)}$`,
+        $options: "i",
+      },
       status: "active",
     });
 
     if (activeAssessment) {
+      const elapsedSeconds = (Date.now() - new Date(activeAssessment.startedAt).getTime()) / 1000;
+      if (Number.isFinite(elapsedSeconds) && elapsedSeconds > (activeAssessment.timeLimit || 1800)) {
+        activeAssessment.status = "expired";
+        activeAssessment.isTimedOut = true;
+        activeAssessment.completedAt = new Date();
+        await activeAssessment.save();
+      } else {
+        return res.status(400).json({
+          message: "You already have an active assessment for this skill. Please complete it first.",
+          activeAssessmentId: activeAssessment._id,
+        });
+      }
+    }
+
+    const blockingActive = await Assessment.findOne({
+      studentId,
+      skillName: {
+        $regex: `^${escapeRegex(normalizedSkillName)}$`,
+        $options: "i",
+      },
+      status: "active",
+    }).select("_id");
+
+    if (blockingActive) {
       return res.status(400).json({
         message: "You already have an active assessment for this skill. Please complete it first.",
-        activeAssessmentId: activeAssessment._id,
+        activeAssessmentId: blockingActive._id,
       });
     }
 
     // Get previous assessment history to avoid question repetition
     const previousAssessments = await Assessment.find({
       studentId,
-      skillName,
+      skillName: {
+        $regex: `^${escapeRegex(normalizedSkillName)}$`,
+        $options: "i",
+      },
       status: { $in: ["completed", "reviewed"] },
     }).sort({ createdAt: -1 }).limit(3);
 
@@ -493,9 +671,9 @@ exports.startAdaptiveAssessment = async (req, res) => {
 
     // Generate dynamic questions (now async with LLM)
     const questions = await questionService.generateQuestions(
-      skillName,
+      normalizedSkillName,
       level,
-      10, // 10 questions per assessment
+      QUESTIONS_PER_ASSESSMENT,
       previousQuestions
     );
     
@@ -507,7 +685,24 @@ exports.startAdaptiveAssessment = async (req, res) => {
       });
     }
 
-    const randomizedQuestions = shuffleArray(questions.map(shuffleQuestionOptions));
+    // Deduplicate questions within this assessment (same question text = duplicate)
+    const seenQuestionTexts = new Set();
+    const deduplicatedQuestions = [];
+    
+    questions.forEach(q => {
+      const qText = String(q.questionText || '').trim().toLowerCase();
+      if (!seenQuestionTexts.has(qText)) {
+        seenQuestionTexts.add(qText);
+        deduplicatedQuestions.push(q);
+      } else {
+        console.warn(`[Assessment] Filtered out duplicate question in same assessment: "${q.questionText.substring(0, 50)}..."`);
+      }
+    });
+    
+    console.log(`[Assessment] After dedup: ${deduplicatedQuestions.length} unique questions in assessment`);
+
+    // Question options are already shuffled in the generation service; avoid re-shuffling here.
+    const randomizedQuestions = shuffleArray(deduplicatedQuestions);
 
     // Create new assessment
     const assessment = await Assessment.create({
@@ -553,6 +748,19 @@ exports.startAdaptiveAssessment = async (req, res) => {
     });
   } catch (error) {
     console.error("Start adaptive assessment error:", error);
+
+    const message = String(error?.message || "");
+    const isExpectedValidationError =
+      message.includes("No approved question bank entries") ||
+      message.includes("No approved questions mapped to active topics") ||
+      message.includes("No fresh questions left") ||
+      message.includes("required") ||
+      message.includes("Invalid level");
+
+    if (isExpectedValidationError) {
+      return res.status(400).json({ message });
+    }
+
     res.status(500).json({ 
       message: "Failed to start assessment",
       error: error.message,
@@ -599,16 +807,23 @@ exports.submitAssessment = async (req, res) => {
     const forcedSubmission = req.body.forcedSubmission === true;
 
     // Check answer count (unless forced submission)
-    if (!forcedSubmission && answers.length !== assessment.questions.length) {
-      return res.status(400).json({
-        message: `Expected ${assessment.questions.length} answers, got ${answers.length}`,
-      });
-    }
+    // Always normalize answers to assessment length so late submit/partial answers don't hard-fail.
+    const processedAnswers = assessment.questions.map((question, index) => {
+      const value = answers[index];
+      if (!Number.isInteger(value)) {
+        return -1;
+      }
 
-    // If forced to submit early, missing answers are treated as wrong (undefined match)
-    const processedAnswers = forcedSubmission ? 
-      assessment.questions.map((_, i) => answers[i] !== undefined ? answers[i] : -1) : 
-      answers;
+      const maxOptionIndex = Array.isArray(question?.options)
+        ? Math.max(0, question.options.length - 1)
+        : -1;
+
+      if (value < 0 || value > maxOptionIndex) {
+        return -1;
+      }
+
+      return value;
+    });
 
     // Analyze performance
     const performance = questionService.analyzePerformance(
@@ -634,11 +849,14 @@ exports.submitAssessment = async (req, res) => {
     // If level-up recommended, update student profile
     if (performance.recommendation.nextLevel) {
       const profile = await StudentProfile.findOne({ userId: studentId });
-      if (profile) {
-        // Find or create skill entry
-        const skillIndex = profile.skills.findIndex(s => s.skillName === assessment.skillName);
-        if (skillIndex >= 0) {
-          // Upgrade level
+      if (profile && Array.isArray(profile.skills)) {
+        // Legacy compatibility: some profiles may not have mutable skill objects.
+        const skillIndex = profile.skills.findIndex((s) => {
+          const skillName = String(s?.skillName || s?.name || "").trim().toLowerCase();
+          return skillName && skillName === String(assessment.skillName || "").trim().toLowerCase();
+        });
+
+        if (skillIndex >= 0 && profile.skills[skillIndex] && typeof profile.skills[skillIndex] === "object") {
           const levelMap = { beginner: "intermediate", intermediate: "advanced" };
           profile.skills[skillIndex].proficiencyLevel = levelMap[assessment.level] || "advanced";
           await profile.save();
@@ -671,7 +889,11 @@ exports.submitAssessment = async (req, res) => {
     });
   } catch (error) {
     console.error("Submit assessment error:", error);
-    res.status(500).json({ message: "Failed to submit assessment" });
+    const includeDetails = process.env.NODE_ENV !== "production";
+    res.status(500).json({
+      message: "Failed to submit assessment",
+      ...(includeDetails ? { details: error?.message || String(error) } : {}),
+    });
   }
 };
 
@@ -721,7 +943,10 @@ exports.getActiveAssessment = async (req, res) => {
 
     const activeAssessment = await Assessment.findOne({
       studentId,
-      skillName,
+      skillName: {
+        $regex: `^${escapeRegex(skillName)}$`,
+        $options: "i",
+      },
       status: "active",
     });
 
@@ -863,7 +1088,6 @@ exports.getAssessmentSummary = async (req, res) => {
     const completed = await Assessment.find({
       studentId,
       status: "completed",
-      skillName: { $in: requiredSkillNames },
       level: { $in: LEVEL_ORDER },
     }).select("skillName level score createdAt");
 
@@ -876,9 +1100,14 @@ exports.getAssessmentSummary = async (req, res) => {
       };
     });
 
+    const requiredSkillByNormalized = new Map(
+      requiredSkillNames.map((name) => [normalizeSkillName(name), name])
+    );
+
     completed.forEach((a) => {
-      if (!summary[a.skillName] || !summary[a.skillName][a.level]) return;
-      const bucket = summary[a.skillName][a.level];
+      const canonicalSkillName = requiredSkillByNormalized.get(normalizeSkillName(a.skillName));
+      if (!canonicalSkillName || !summary[canonicalSkillName] || !summary[canonicalSkillName][a.level]) return;
+      const bucket = summary[canonicalSkillName][a.level];
       const score = Number(a.score) || 0;
       bucket.attempts += 1;
       bucket.lastScore = score;
@@ -890,11 +1119,16 @@ exports.getAssessmentSummary = async (req, res) => {
       });
     });
 
+    // Eligibility check: all required skills must have 90+ on beginner, intermediate, advanced
     const unmetRequirements = [];
     requiredSkillNames.forEach((skill) => {
       LEVEL_ORDER.forEach((lvl) => {
-        if ((summary[skill][lvl].bestScore || 0) < 90) {
-          unmetRequirements.push({ skill, level: lvl, score: summary[skill][lvl].bestScore || 0 });
+        const levelData = summary[skill][lvl];
+        const bestScore = levelData?.bestScore || 0;
+        const attempts = levelData?.attempts || 0;
+
+        if (attempts === 0 || bestScore < FINAL_ASSESSMENT_MIN_SCORE) {
+          unmetRequirements.push({ skill, level: lvl, score: bestScore, attempts });
         }
       });
     });
@@ -946,7 +1180,8 @@ exports.requestFinalAssessment = async (req, res) => {
       });
     }
 
-    // Eligibility rule: every required skill must have all 3 levels completed with score >= 90
+    // Eligibility rule (temporary testing mode): each required skill must have
+    // beginner/intermediate/advanced completed at least once; score threshold disabled.
     const selectedRoleId = roleId || profile.selectedRole.roleId._id;
     const role = await Role.findById(selectedRoleId).populate("requiredSkills", "name");
 
@@ -965,24 +1200,34 @@ exports.requestFinalAssessment = async (req, res) => {
     const completedAssessments = await Assessment.find({
       studentId,
       status: "completed",
-      skillName: { $in: requiredSkillNames },
       level: { $in: LEVEL_ORDER },
     }).select("skillName level score");
 
+    const requiredSkillByNormalized = new Map(
+      requiredSkillNames.map((name) => [normalizeSkillName(name), name])
+    );
+
     const bestScoreMap = new Map();
+    const attemptMap = new Map();
     completedAssessments.forEach((a) => {
-      const key = `${a.skillName}::${a.level}`;
+      const canonicalSkillName = requiredSkillByNormalized.get(normalizeSkillName(a.skillName));
+      if (!canonicalSkillName) return;
+
+      const key = `${canonicalSkillName}::${a.level}`;
       const prev = bestScoreMap.get(key) || 0;
       const current = Number(a.score) || 0;
       if (current > prev) bestScoreMap.set(key, current);
+      attemptMap.set(key, (attemptMap.get(key) || 0) + 1);
     });
 
+    // Eligibility check: all required skills must have 90+ on beginner, intermediate, advanced
     const unmetRequirements = [];
     requiredSkillNames.forEach((skill) => {
       LEVEL_ORDER.forEach((lvl) => {
         const score = bestScoreMap.get(`${skill}::${lvl}`) || 0;
-        if (score < 90) {
-          unmetRequirements.push({ skill, level: lvl, score });
+        const attempts = attemptMap.get(`${skill}::${lvl}`) || 0;
+        if (attempts === 0 || score < FINAL_ASSESSMENT_MIN_SCORE) {
+          unmetRequirements.push({ skill, level: lvl, score, attempts });
         }
       });
     });
@@ -993,21 +1238,23 @@ exports.requestFinalAssessment = async (req, res) => {
         unmetRequirements,
       });
     }
+    //
+    // if (unmetRequirements.length > 0) {
+    //   return res.status(400).json({
+    //     message: "Final assessment requires completed beginner, intermediate, and advanced attempts for all required skills.",
+    //     unmetRequirements,
+    //   });
+    // }
 
     // Create assessment request
     const assessment = await Assessment.create({
       studentId,
+      roleId: selectedRoleId,
       skillName: "Final Assessment",
-      skillId: null, // Not tied to specific skill
       level: "advanced",
       type: "faculty-scheduled",
       status: "requested",
       requestedAt: new Date(),
-      metadata: {
-        roleId: selectedRoleId,
-        roleName: role.roleName,
-        requestType: "final_assessment"
-      }
     });
 
     res.status(201).json({

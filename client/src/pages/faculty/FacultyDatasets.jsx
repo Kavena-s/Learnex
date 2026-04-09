@@ -4,6 +4,7 @@ import axios from 'axios';
 import { useAuth } from '../../context/AuthContext';
 import FacultyLayout from '../../components/FacultyLayout';
 import authService from '../../services/authService';
+import useAutoRefresh from '../../hooks/useAutoRefresh';
 
 export default function FacultyDatasets() {
   useAuth();
@@ -26,6 +27,7 @@ export default function FacultyDatasets() {
   const [domainForm, setDomainForm] = useState({ name: '' });
   const initialRoleForm = { 
     roleName: '', 
+    domain: '',
     description: '', 
     minCGPA: 0, 
     minProjects: 0, 
@@ -41,10 +43,8 @@ export default function FacultyDatasets() {
   const [roleForm, setRoleForm] = useState(initialRoleForm);
   const [editingRoleId, setEditingRoleId] = useState(null);
 
-  useEffect(() => { fetchData(); }, [activeTab]);
-
-  const fetchData = async () => {
-    setLoading(true);
+  const fetchData = async ({ silent = false } = {}) => {
+    if (!silent) setLoading(true);
     try {
       const token = authService.getToken();
       const headers = { Authorization: `Bearer ${token}` };
@@ -61,20 +61,27 @@ export default function FacultyDatasets() {
         setDomains(Array.isArray(domainsRes.data) ? domainsRes.data : (domainsRes.data?.domains || []));
       }
       if (activeTab === 'roles') {
-        // Load skills and interests too for the role form
-        const [rolesRes, skillsRes, interestsRes] = await Promise.all([
+        // Load supporting datasets for the role form
+        const [rolesRes, skillsRes, interestsRes, domainsRes] = await Promise.all([
           axios.get('http://localhost:5000/api/faculty/roles', { headers }),
           axios.get('http://localhost:5000/api/faculty/skills', { headers }),
-          axios.get('http://localhost:5000/api/faculty/interests', { headers })
+          axios.get('http://localhost:5000/api/faculty/interests', { headers }),
+          axios.get('http://localhost:5000/api/faculty/domains', { headers }),
         ]);
         setRoles(Array.isArray(rolesRes.data) ? rolesRes.data : (rolesRes.data?.roles || []));
         setSkills(Array.isArray(skillsRes.data) ? skillsRes.data : (skillsRes.data?.skills || []));
         setInterests(Array.isArray(interestsRes.data) ? interestsRes.data : (interestsRes.data?.interests || []));
+        setDomains(Array.isArray(domainsRes.data) ? domainsRes.data : (domainsRes.data?.domains || []));
       }
     } catch (err) {
       console.error('Failed to fetch data:', err);
-    } finally { setLoading(false); }
+    } finally {
+      if (!silent) setLoading(false);
+    }
   };
+
+  useEffect(() => { fetchData(); }, [activeTab]);
+  useAutoRefresh(fetchData, { intervalMs: 30000 });
 
   const tokenHeaders = async () => ({ Authorization: `Bearer ${authService.getToken()}` });
 
@@ -137,6 +144,7 @@ export default function FacultyDatasets() {
     setEditingRoleId(role._id);
     setRoleForm({
       roleName: role.roleName || '',
+      domain: role.domain || '',
       description: role.description || '',
       minCGPA: role.minCGPA ?? 0,
       minProjects: role.minProjects ?? 0,
@@ -324,6 +332,20 @@ export default function FacultyDatasets() {
                 <div className="col-md-6">
                   <label className="form-label text-dark">Role Name *</label>
                   <input className="form-control" value={roleForm.roleName} onChange={(e)=>setRoleForm({...roleForm,roleName:e.target.value})} placeholder="e.g. Full Stack Developer" required />
+                </div>
+                <div className="col-md-6">
+                  <label className="form-label text-dark">Domain *</label>
+                  <select
+                    className="form-select"
+                    value={roleForm.domain}
+                    onChange={(e)=>setRoleForm({...roleForm,domain:e.target.value})}
+                    required
+                  >
+                    <option value="">Select domain</option>
+                    {domains.map((d) => (
+                      <option key={`role-domain-${d._id}`} value={d.name}>{d.name}</option>
+                    ))}
+                  </select>
                 </div>
                 <div className="col-md-3">
                   <label className="form-label text-dark">Min CGPA *</label>

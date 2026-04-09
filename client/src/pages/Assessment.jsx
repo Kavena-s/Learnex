@@ -23,6 +23,12 @@ export default function Assessment() {
 
   const containerRef = useRef(null);
 
+  const handleAuthFailure = useCallback((defaultMessage = 'Session expired. Please login again.') => {
+    authService.logout();
+    alert(defaultMessage);
+    navigate('/login', { replace: true });
+  }, [navigate]);
+
   useEffect(() => {
     fetchAssessment();
   }, [assessmentId]);
@@ -44,22 +50,40 @@ export default function Assessment() {
   const fetchAssessment = async () => {
     try {
       const token = authService.getToken();
+      if (!token) {
+        handleAuthFailure('Your session is missing or expired. Please login again.');
+        return;
+      }
       // To get the actual questions, we trigger active check
-      const res = await axios.get(`http://localhost:5000/api/assessments/active/${skillName}`, {
+      const res = await axios.get(`http://localhost:5000/api/assessments/active/${encodeURIComponent(skillName)}`, {
         headers: { Authorization: `Bearer ${token}` }
       });
       
       console.log('Assessment data received:', res.data);
-      
-      if (!res.data.hasActive || res.data.assessmentId !== assessmentId) {
-        setError('Assessment is no longer active or expired.');
-      } else {
-        console.log('Setting assessment with questions:', res.data.questions?.length || 0);
-        setAssessment(res.data);
-        setAnswers(new Array(res.data.totalQuestions).fill(-1));
+
+      if (!res.data.hasActive) {
+        setError(res.data.wasExpired ? 'Assessment time is over. Please start a new attempt.' : 'Assessment is no longer active or expired.');
+        return;
       }
+
+      const activeId = String(res.data.assessmentId || '');
+      const currentId = String(assessmentId || '');
+
+      // If URL points to a stale attempt, move to the currently active one.
+      if (activeId && activeId !== currentId) {
+        navigate(`/assessment/${activeId}?skill=${res.data.skillName || skillName}`, { replace: true });
+        return;
+      }
+
+      console.log('Setting assessment with questions:', res.data.questions?.length || 0);
+      setAssessment(res.data);
+      setAnswers(new Array(res.data.totalQuestions).fill(-1));
     } catch (err) {
       console.error('Fetch assessment error:', err);
+      if (err.response?.status === 401) {
+        handleAuthFailure('Your session expired during assessment load. Please login and continue.');
+        return;
+      }
       setError('Failed to load assessment');
     } finally {
       setLoading(false);
@@ -72,6 +96,11 @@ export default function Assessment() {
     
     try {
       const token = authService.getToken();
+      if (!token) {
+        handleAuthFailure('Your session expired before submission. Please login again.');
+        setSubmitting(false);
+        return;
+      }
       const res = await axios.post(`http://localhost:5000/api/assessments/${assessmentId}/submit`, {
         answers,
         forcedSubmission: forced
@@ -88,10 +117,15 @@ export default function Assessment() {
       // Fetch attempt history
       fetchAttemptHistory();
     } catch (err) {
+      if (err.response?.status === 401) {
+        handleAuthFailure('Your session expired during submission. Please login and retry.');
+        setSubmitting(false);
+        return;
+      }
       alert(err.response?.data?.message || 'Failed to submit assessment');
       setSubmitting(false);
     }
-  }, [assessmentId, answers, submitting, examComplete]);
+  }, [assessmentId, answers, submitting, examComplete, handleAuthFailure]);
 
   // Tab Switch (Visibility) Detection
   useEffect(() => {
@@ -101,6 +135,7 @@ export default function Assessment() {
       if (document.hidden) {
         try {
           const token = authService.getToken();
+          if (!token) return;
           const res = await axios.post(`http://localhost:5000/api/assessments/${assessmentId}/warning`, {}, {
             headers: { Authorization: `Bearer ${token}` }
           });
@@ -151,6 +186,7 @@ export default function Assessment() {
   const currentLevel = assessment?.level || 'beginner';
   const answeredCount = answers.filter((a) => a !== -1).length;
   const unansweredCount = Math.max(0, (assessment?.totalQuestions || 0) - answeredCount);
+  const canReattemptCurrentLevel = Number(result?.score || 0) < 90;
 
   const handleReattempt = async () => {
     try {
@@ -162,7 +198,14 @@ export default function Assessment() {
       );
       navigate(`/assessment/${res.data.assessmentId}?skill=${skillName}`);
     } catch (err) {
-      alert(err.response?.data?.message || 'Failed to start reattempt');
+      if (err.response?.status === 401) {
+        handleAuthFailure('Your session expired. Please login again.');
+        return;
+      }
+      const serverMessage = err.response?.data?.message;
+      const serverDetails = err.response?.data?.error;
+      const fallback = err.message || 'Failed to start reattempt';
+      alert(serverMessage || serverDetails || fallback);
     }
   };
 
@@ -255,9 +298,15 @@ export default function Assessment() {
           )}
 
           <div className="d-flex justify-content-center gap-3 flex-wrap">
-            <button onClick={handleReattempt} className="btn btn-success btn-lg px-4 shadow">
-              Reattempt Level
-            </button>
+            {canReattemptCurrentLevel ? (
+              <button onClick={handleReattempt} className="btn btn-success btn-lg px-4 shadow">
+                Reattempt Level
+              </button>
+            ) : (
+              <button onClick={() => navigate('/dashboard')} className="btn btn-outline-success btn-lg px-4 shadow">
+                Level Cleared (90+) 
+              </button>
+            )}
             <button onClick={() => navigate('/dashboard')} className="btn btn-primary btn-lg px-4 shadow">
               Return to Dashboard
             </button>

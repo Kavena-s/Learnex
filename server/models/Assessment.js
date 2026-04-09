@@ -84,12 +84,10 @@ const assessmentSchema = new mongoose.Schema(
     correctAnswers: Number,
 
     // Adaptive learning
+    // Use plain object because concept labels can contain '.' (e.g., Node.js).
     conceptPerformance: {
-      type: Map,
-      of: {
-        total: Number,
-        correct: Number,
-      },
+      type: mongoose.Schema.Types.Mixed,
+      default: {},
     },
     weakConcepts: [String],
 

@@ -34,7 +34,23 @@ const studentProfileSchema = new mongoose.Schema(
       trackName: String, // Denormalized for quick access
       lockedAt: Date,
       canChange: { type: Boolean, default: false }, // Controlled by admin
+      finalAssessmentPassed: { type: Boolean, default: false },
+      qualifiedAt: Date,
+      qualifiedBy: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+      qualificationAssessmentId: { type: mongoose.Schema.Types.ObjectId, ref: "Assessment" },
     },
+
+    // Persist all role-level final qualifications for profile display/history.
+    qualifiedRoles: [
+      {
+        roleId: { type: mongoose.Schema.Types.ObjectId, ref: "Role" },
+        roleName: String,
+        trackName: String,
+        qualifiedAt: { type: Date, default: Date.now },
+        qualifiedBy: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+        sourceAssessmentId: { type: mongoose.Schema.Types.ObjectId, ref: "Assessment" },
+      },
+    ],
 
     // Roadmap Progress (track-aware)
     roadmapProgress: {

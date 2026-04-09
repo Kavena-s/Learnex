@@ -3,10 +3,12 @@ import axios from 'axios';
 import { useAuth } from '../../context/AuthContext';
 import FacultyLayout from '../../components/FacultyLayout';
 import authService from '../../services/authService';
+import useAutoRefresh from '../../hooks/useAutoRefresh';
 
 export default function FacultyAssessments() {
-  const { user } = useAuth();
+  useAuth();
   const [assessments, setAssessments] = useState([]);
+  const [profilesByUserId, setProfilesByUserId] = useState({});
   const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState('all');
   const [searchTerm, setSearchTerm] = useState('');
@@ -16,20 +18,39 @@ export default function FacultyAssessments() {
     return skill === 'final assessment';
   };
 
-  useEffect(() => { fetchAssessments(); }, [filter]);
-
-  const fetchAssessments = async () => {
-    setLoading(true);
+  const fetchAssessments = async ({ silent = false } = {}) => {
+    if (!silent) setLoading(true);
     try {
       const token = authService.getToken();
       const params = { scope: 'final' };
       if (filter !== 'all') params.status = filter;
-      const res = await axios.get('http://localhost:5000/api/faculty/assessments', { headers: { Authorization: `Bearer ${token}` }, params });
-      const items = Array.isArray(res.data) ? res.data : (res.data?.assessments || []);
+      const [assessmentRes, profilesRes] = await Promise.all([
+        axios.get('http://localhost:5000/api/faculty/assessments', {
+          headers: { Authorization: `Bearer ${token}` },
+          params,
+        }),
+        axios.get('http://localhost:5000/api/profile/all', {
+          headers: { Authorization: `Bearer ${token}` },
+        }),
+      ]);
+
+      const items = Array.isArray(assessmentRes.data)
+        ? assessmentRes.data
+        : (assessmentRes.data?.assessments || []);
+
+      const profileMap = {};
+      (profilesRes.data || []).forEach((p) => {
+        if (p?.userId) profileMap[String(p.userId)] = p;
+      });
+
+      setProfilesByUserId(profileMap);
       setAssessments(items.filter(isFinalAssessment));
     } catch (err) { console.error('Failed to fetch assessments:', err); }
-    finally { setLoading(false); }
+    finally { if (!silent) setLoading(false); }
   };
+
+  useEffect(() => { fetchAssessments(); }, [filter]);
+  useAutoRefresh(fetchAssessments, { intervalMs: 30000 });
 
   const filteredAssessments = assessments.filter((a) => {
     const term = searchTerm.trim().toLowerCase();
@@ -40,34 +61,59 @@ export default function FacultyAssessments() {
     const status = a.status?.toLowerCase() || '';
     const level = a.level?.toLowerCase() || '';
     const skill = (a.skillName || a.skillId?.name || '').toLowerCase();
+    const role = String(a.roleId?.roleName || '').toLowerCase();
 
-    return studentName.includes(term) || studentEmail.includes(term) || status.includes(term) || level.includes(term) || skill.includes(term);
+    return studentName.includes(term) || studentEmail.includes(term) || status.includes(term) || level.includes(term) || skill.includes(term) || role.includes(term);
   });
 
   const handleScheduleAssessment = async (assessmentId) => {
-    const scheduledDate = prompt('Enter scheduled date (YYYY-MM-DD):');
+    const scheduledDate = prompt('Enter date (YYYY-MM-DD):');
     if (!scheduledDate) return;
-    const mode = prompt('Enter mode (online/offline):', 'online');
-    if (!mode) return;
+    
+    // Validate date format
+    const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
+    if (!dateRegex.test(scheduledDate)) {
+      alert('Invalid date format. Please use YYYY-MM-DD');
+      return;
+    }
+
+    const timeSlot = prompt('Enter time slot (FN for Forenoon / AN for Afternoon):');
+    if (!timeSlot) return;
+    
+    const slot = String(timeSlot).toUpperCase().trim();
+    if (!['FN', 'AN'].includes(slot)) {
+      alert('Invalid time slot. Please enter FN (Forenoon) or AN (Afternoon)');
+      return;
+    }
+
     try {
       const token = authService.getToken();
       await axios.post(
         `http://localhost:5000/api/faculty/assessments/${assessmentId}/schedule`,
-        { scheduledDate, mode: String(mode).toLowerCase() },
+        { scheduledDate, timeSlot: slot },
         { headers: { Authorization: `Bearer ${token}` } }
       );
       fetchAssessments();
-    } catch (err) { alert(err.response?.data?.message || 'Failed to schedule assessment'); }
+    } catch (err) {
+      const errorMsg = err.response?.data?.message || err.response?.data?.error || err.message || 'Failed to schedule assessment';
+      const details = err.response?.data?.details ? `\n\nDetails: ${err.response.data.details}` : '';
+      alert(`Error: ${errorMsg}${details}`);
+      console.error('Schedule error:', err.response?.data || err.message);
+    }
   };
 
-  const handleCompleteAssessment = async (assessmentId) => {
-    const result = prompt("Enter result (passed/needs_improvement):", 'passed');
+  const handleCompleteAssessment = async (assessmentId, result) => {
     if (!result) return;
     try {
       const token = authService.getToken();
       await axios.put(
         `http://localhost:5000/api/faculty/assessments/${assessmentId}/complete`,
-        { result: String(result).toLowerCase() },
+        {
+          result: String(result).toLowerCase(),
+          facultyNotes: result === 'passed'
+            ? 'Final assessment passed. Student marked as qualified for selected role.'
+            : 'Final assessment needs improvement. Student is not yet role-qualified.',
+        },
         { headers: { Authorization: `Bearer ${token}` } }
       );
       fetchAssessments();
@@ -98,7 +144,7 @@ export default function FacultyAssessments() {
         <input
           type="text"
           className="form-control"
-          placeholder="Search by student name, email, status, or level..."
+          placeholder="Search by student name, email, status, level, or role..."
           value={searchTerm}
           onChange={(e) => setSearchTerm(e.target.value)}
         />
@@ -108,42 +154,38 @@ export default function FacultyAssessments() {
         {loading ? <div className="p-4 text-center"><div className="spinner-gradient mx-auto"></div></div> : (
           <div className="table-responsive">
             <table className="table table-hover mb-0">
-              <thead><tr><th>Student</th><th>Skill</th><th>Level</th><th>Status</th><th>Score</th><th>Attempt #</th><th>Date</th><th>Actions</th></tr></thead>
+              <thead><tr><th>Student</th><th>Role</th><th>Skill</th><th>Level</th><th>Status</th><th>Qualification</th><th>Date</th><th>Actions</th></tr></thead>
               <tbody>
                 {filteredAssessments.map((a, idx)=>{
-                  // Count how many times this student attempted this skill/level before this assessment
-                  const priorAttempts = filteredAssessments.filter((other, otherIdx) => 
-                    otherIdx > idx && 
-                    other.studentId?._id === a.studentId?._id && 
-                    (other.skillName || other.skillId?.name) === (a.skillName || a.skillId?.name) &&
-                    other.level === a.level &&
-                    other.status === 'completed'
-                  ).length;
-                  const attemptNumber = priorAttempts + 1;
+                  const studentProfile = profilesByUserId[String(a.studentId?._id)] || null;
+                  const roleLabel =
+                    studentProfile?.selectedRole?.trackName ||
+                    studentProfile?.selectedRole?.roleId?.roleName ||
+                    a.roleId?.roleName ||
+                    'Not selected';
+                  const isQualified = Boolean(studentProfile?.selectedRole?.finalAssessmentPassed);
+                  const statusBadgeClass =
+                    a.status === 'requested'
+                      ? 'text-bg-warning'
+                      : a.status === 'scheduled'
+                        ? 'text-bg-info'
+                        : a.status === 'completed'
+                          ? 'text-bg-success'
+                          : 'text-bg-secondary';
 
                   return (
                     <tr key={a._id}>
                       <td><div>{a.studentId?.name || 'Unknown'}</div><small className="text-muted">{a.studentId?.email || ''}</small></td>
+                      <td>{roleLabel}</td>
                       <td>{a.skillName || a.skillId?.name || 'N/A'}</td>
                       <td className="text-capitalize">{a.level || 'beginner'}</td>
-                      <td><span className="badge text-bg-secondary">{a.status}</span></td>
+                      <td><span className={`badge ${statusBadgeClass}`}>{a.status}</span></td>
                       <td>
-                        {a.score != null ? (
-                          <span className={`badge ${
-                            a.score >= 90 ? 'text-bg-success' : 
-                            a.score >= 50 ? 'text-bg-warning' : 
-                            'text-bg-danger'
-                          }`}>
-                            {a.score}%
-                          </span>
-                        ) : '-'}
-                      </td>
-                      <td>
-                        {a.status === 'completed' && attemptNumber > 1 ? (
-                          <span className="badge text-bg-info">Attempt #{attemptNumber}</span>
-                        ) : a.status === 'completed' ? (
-                          <span className="text-muted small">First</span>
-                        ) : '-'}
+                        {isQualified ? (
+                          <span className="badge text-bg-success">Qualified Role</span>
+                        ) : (
+                          <span className="badge text-bg-warning">Not Qualified Yet</span>
+                        )}
                       </td>
                       <td className="small">{new Date(a.scheduledDate || a.createdAt).toLocaleString()}</td>
                       <td>
@@ -153,8 +195,14 @@ export default function FacultyAssessments() {
                             <button className="btn btn-sm btn-outline-danger" onClick={()=>handleDeclineAssessment(a._id)}>Decline</button>
                           </div>
                         )}
-                        {a.status === 'scheduled' && <button className="btn btn-sm btn-outline-success" onClick={()=>handleCompleteAssessment(a._id)}>Complete</button>}
+                        {a.status === 'scheduled' && (
+                          <div className="d-flex gap-2">
+                            <button className="btn btn-sm btn-outline-success" onClick={()=>handleCompleteAssessment(a._id, 'passed')}>Mark Passed</button>
+                            <button className="btn btn-sm btn-outline-warning" onClick={()=>handleCompleteAssessment(a._id, 'needs_improvement')}>Needs Improvement</button>
+                          </div>
+                        )}
                         {a.status === 'declined' && <span className="text-muted small">Declined</span>}
+                        {a.status === 'completed' && <span className="text-success small">Completed</span>}
                       </td>
                     </tr>
                   );

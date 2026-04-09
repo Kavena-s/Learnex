@@ -45,6 +45,7 @@ const roadmapLevelSchema = new mongoose.Schema({
 const roleSchema = new mongoose.Schema(
   {
     roleName: { type: String, required: true, unique: true },
+    domain: { type: String, trim: true, default: "" },
     description: String,
     
     // Eligibility

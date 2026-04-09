@@ -351,6 +351,22 @@ Fetches curated learning resources by skill level.
 ### questionGenerationService
 Generates adaptive assessment questions based on skill and difficulty level.
 
+## Database Maintenance
+
+### Backfill legacy role domains
+
+If older role documents still show `Unspecified` in analytics, run the domain backfill once after configuring the Domain collection:
+
+```bash
+npm run roles:backfill-domains
+```
+
+To preview the changes without saving anything:
+
+```bash
+node scripts/backfillRoleDomains.js --dry-run
+```
+
 ## Testing
 
 ### Run Integration Tests

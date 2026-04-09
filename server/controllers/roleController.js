@@ -2,6 +2,7 @@
 const Role = require("../models/Role");
 const Skill = require("../models/Skill");
 const Interest = require("../models/Interest");
+const Domain = require("../models/Domain");
 
 /**
  * Create a new role (faculty only)
@@ -22,6 +23,7 @@ exports.createRole = async (req, res) => {
   try {
     const {
       roleName,
+      domain,
       description,
       minCGPA,
       minProjects,
@@ -33,10 +35,16 @@ exports.createRole = async (req, res) => {
     } = req.body;
 
     // Validate required fields
-    if (!roleName || minCGPA === undefined || minProjects === undefined) {
+    if (!roleName || !domain || minCGPA === undefined || minProjects === undefined) {
       return res.status(400).json({
-        message: "roleName, minCGPA, and minProjects are required",
+        message: "roleName, domain, minCGPA, and minProjects are required",
       });
+    }
+
+    const normalizedDomain = String(domain || "").trim();
+    const existingDomain = await Domain.findOne({ name: normalizedDomain });
+    if (!existingDomain) {
+      return res.status(400).json({ message: "Invalid domain. Please select a configured domain." });
     }
 
     // Validate CGPA range
@@ -78,6 +86,7 @@ exports.createRole = async (req, res) => {
     // Create role
     const role = await Role.create({
       roleName,
+      domain: normalizedDomain,
       description: description || "",
       minCGPA,
       minProjects,
@@ -215,6 +224,18 @@ exports.updateRole = async (req, res) => {
       if (skills.length !== updates.requiredSkills.length) {
         return res.status(400).json({ message: "Invalid skill IDs" });
       }
+    }
+
+    if (updates.domain !== undefined) {
+      const normalizedDomain = String(updates.domain || "").trim();
+      if (!normalizedDomain) {
+        return res.status(400).json({ message: "domain cannot be empty" });
+      }
+      const existingDomain = await Domain.findOne({ name: normalizedDomain });
+      if (!existingDomain) {
+        return res.status(400).json({ message: "Invalid domain. Please select a configured domain." });
+      }
+      updates.domain = normalizedDomain;
     }
 
     // Validate interests if being updated
